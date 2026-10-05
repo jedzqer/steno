@@ -1,6 +1,6 @@
-# SenseVoice 视频/音频转文字工具
+# steno · 视频/音频速记工具
 
-基于 [SenseVoiceSmall](https://github.com/FunAudioLLM/SenseVoice) 模型的语音识别脚本，支持视频提取音频并转录为文字。
+基于 [SenseVoiceSmall](https://github.com/FunAudioLLM/SenseVoice) 模型的速记工具，支持视频提取音频并转录为文字。
 
 ## 环境要求
 
