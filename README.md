@@ -17,6 +17,20 @@ pip install torch soundfile yt-dlp
 
 ## 使用方法
 
+### 网页界面（推荐）
+
+```bash
+python webui.py            # 启动后自动打开浏览器，默认 http://127.0.0.1:8321
+python webui.py --port 9000 --no-browser
+```
+
+- 拖放 / 选择本地媒体文件，或粘贴视频链接（YouTube、B站等，支持仅下载音轨与浏览器 cookies）
+- 实时展示 下载 → 加载模型 → 提取音频 → 转录 各阶段进度，可中途取消
+- 转录结果在线查看、复制、下载；历史记录浏览、搜索、删除
+- 侧栏展示 GPU / 模型 / FFmpeg / yt-dlp 状态；退出服务按钮可一键关闭后台
+
+### 命令行
+
 ```bash
 # 基本用法（本地文件）
 python transcribe_video.py <输入文件路径>

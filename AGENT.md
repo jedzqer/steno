@@ -4,19 +4,24 @@
 
 ## 项目定位
 
-**steno** 是一个 Windows 本地视频/音频转文字（速记）CLI 工具：
+**steno** 是一个 Windows 本地视频/音频转文字（速记）工具，提供 CLI 与 WebUI 两种入口：
 
 1. 接受本地媒体文件 **或视频网站 URL**（URL 时用 yt-dlp 自动下载到 `videos/`）
 2. 用 FFmpeg 提取 16kHz 单声道音频
 3. 用 SenseVoiceSmall 模型分块转录为文字，保存为 `_out.txt`
 
-单文件核心脚本：`transcribe_video.py`。项目文档（README、本文件）均为中文。
+核心脚本：`transcribe_video.py`（全部业务逻辑）；`webui.py` 是其上的 FastAPI 网页封装。项目文档（README、本文件）均为中文。
 
 ## 目录结构
 
 ```text
 steno/
 ├── transcribe_video.py      # 核心脚本：CLI 入口 + 全部逻辑（下载/提取/转录）
+├── webui.py                 # FastAPI 网页服务：任务队列/进度/历史 API，复用核心脚本
+├── static/                  # WebUI 前端（无构建步骤的原生 HTML/CSS/JS）
+│   ├── index.html
+│   ├── style.css
+│   └── app.js
 ├── README.md                # 面向使用者的说明
 ├── AGENT.md                 # 本文件
 ├── .gitignore
@@ -32,6 +37,9 @@ python transcribe_video.py <本地文件路径 | 视频URL>
 python transcribe_video.py <URL> --audio-only                  # 只下载音轨，更快
 python transcribe_video.py <URL> --cookies-from-browser chrome # 需登录的站点
 python transcribe_video.py <文件> -o out.txt --language zh     # 其余参数见 --help
+
+python webui.py                       # WebUI：默认 http://127.0.0.1:8321，自动开浏览器
+python webui.py --port 9000 --no-browser
 ```
 
 ## 环境依赖
@@ -57,7 +65,8 @@ main()
 
 - **120 秒分块 + 1 秒重叠**：SenseVoiceSmall 的 CTC decoder 在约 120s 内表现最佳；更短会切断语句，更长对齐质量下降。`--chunk`/`--overlap` 可调
 - **sys.path 注入**：`from model import SenseVoiceSmall` 依赖脚本把项目内 `SenseVoice-official/` 插入 sys.path；该目录是独立 git 仓库
-- **yt-dlp 用 Python API 而非子进程**：`YoutubeDL(opts)` + `extract_info(url, download=True)`，最终路径取 `info['requested_downloads'][0]['filepath']`（含合并/后处理）。`noplaylist=True` 防止播放列表整包下载
+- **yt-dlp 用 Python API 而非子进程**：`YoutubeDL(opts)` + `extract_info(url, download=True)`，最终路径取 `info['requested_downloads'][0]['filepath']`（含合并/后处理）。`noplaylist=True` 防止播放列表整包下载。`download_video()` 另有可选 `progress_cb(status, downloaded, total, speed)` 供 WebUI 展示进度（默认 None，不影响 CLI）
+- **WebUI 架构**：`webui.py` 完全复用 `transcribe_video.py`（导入为模块），不重复实现业务逻辑。单 worker 线程串行消费任务队列（GPU 推理串行化）；模型进程内缓存只加载一次；取消通过 `stop_event`（转录阶段核心脚本原生支持；下载阶段 WebUI 在 progress_cb 里抛 `yt_dlp.utils.DownloadCancelled` 沿 hook 传播中断）；前端为 static/ 下原生三件套，无构建步骤，轮询 `/api/jobs` 展示进度
 - **emoji 过滤**：funasr 会把 SenseVoice 的情绪/事件标记（`<|ANGRY|>`、`<|BGM|>`）转成 emoji（😡🎼等），按 Unicode 区段 `U+1F000–U+1FFFF` 整体过滤，勿改回单字符枚举
 - **stdout 编码兜底**：main() 入口对 stdout/stderr 做 `reconfigure(errors='replace')`，避免重定向/管道输出时 GBK 无法编码 emoji 而崩溃
 

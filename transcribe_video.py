@@ -103,7 +103,7 @@ def is_url(text):
 
 
 def download_video(url, output_dir=DOWNLOAD_DIR, audio_only=False,
-                   cookies_from_browser=None):
+                   cookies_from_browser=None, progress_cb=None):
     """用 yt-dlp 从视频网站（YouTube、B站等数千个站点）下载视频/音频。
 
     返回下载后的文件路径（Path）。文件保存到 output_dir（默认项目 videos/ 目录），
@@ -112,6 +112,9 @@ def download_video(url, output_dir=DOWNLOAD_DIR, audio_only=False,
     audio_only: 仅下载音轨，转录场景下载更快、占盘更小。
     cookies_from_browser: 浏览器名称（chrome/firefox/edge 等），
         用于需要登录的站点（如会员/ age-restricted 内容）。
+    progress_cb: 可选回调 progress_cb(status, downloaded, total, speed)，
+        status 为 'downloading'/'finished'；供 WebUI 展示进度。回调内抛出的
+        异常会原样传播（WebUI 借此用 DownloadCancelled 中断下载）。
     """
     try:
         import yt_dlp
@@ -123,6 +126,15 @@ def download_video(url, output_dir=DOWNLOAD_DIR, audio_only=False,
     output_dir.mkdir(parents=True, exist_ok=True)
 
     def progress_hook(d):
+        if progress_cb is not None:   # WebUI 接管进度展示，控制台不再打印
+            if d['status'] == 'downloading':
+                progress_cb('downloading',
+                            d.get('downloaded_bytes', 0),
+                            d.get('total_bytes') or d.get('total_bytes_estimate'),
+                            d.get('speed'))
+            elif d['status'] == 'finished':
+                progress_cb('finished', None, None, None)
+            return
         if d['status'] == 'downloading':
             downloaded = d.get('downloaded_bytes', 0)
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
