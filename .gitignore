@@ -1,0 +1,31 @@
+# 官方仓库（独立 git 仓库，不纳入本仓库）
+/SenseVoice-official/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 工具缓存 / 本地配置
+.pi/
+
+# 媒体文件（体积大，不入库）
+videos/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+*.flv
+*.webm
+*.m4v
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.aac
+*.m4a
+*.wma
+
+# 转录输出
+*_out.txt
