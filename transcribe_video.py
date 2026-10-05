@@ -160,6 +160,13 @@ def download_video(url, output_dir=DOWNLOAD_DIR, audio_only=False,
         'no_warnings': True,
         'noprogress': True,         # 关闭 yt-dlp 自带进度条，用自定义 progress_hook
         'progress_hooks': [progress_hook],
+        # Python API 不会继承 yt-dlp CLI 的默认参数：不显式设置时下载重试次数为 0，
+        # B 站 PCDN 节点（*.mcdn.bilivideo.cn）一次读超时就会让整个下载直接失败。
+        'retries': 10,              # 网络错误重试次数；配合 continuedl（默认开启）断点续传
+        'fragment_retries': 10,     # HLS/DASH 分片重试次数
+        'file_access_retries': 5,   # 文件被占用/读写错误重试次数
+        'extractor_retries': 3,     # 抽取器已知错误重试次数
+        'socket_timeout': 20,       # 读超时秒数（显式声明，避免依赖 networking 层隐式默认值）
     }
     if not audio_only:
         ydl_opts['merge_output_format'] = 'mp4'

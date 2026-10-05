@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 import webbrowser
 from pathlib import Path
@@ -144,6 +145,22 @@ def _ensure_model(device: str):
         return _MODEL, _MODEL_KWARGS
 
 
+DOWNLOAD_ATTEMPTS = 3        # 下载总尝试次数（首次 + 2 次整体重试）
+DOWNLOAD_RETRY_DELAY = 4     # 重试前的等待秒数
+
+
+def _sleep_cancellable(seconds: float, stop_event: threading.Event) -> None:
+    """分段睡眠等待，期间被取消立即抛 _Cancelled。"""
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if stop_event.is_set():
+            raise _Cancelled()
+        time.sleep(min(0.2, remaining))
+
+
 def _download(job: Job) -> Path:
     if TV is None:
         raise RuntimeError(f"后端依赖不可用，无法转录：{TV_ERROR}")
@@ -159,12 +176,29 @@ def _download(job: Job) -> Path:
             job.progress = (downloaded / total) if total else None
 
     try:
-        return TV.download_video(
-            job.source,
-            audio_only=o.get("audio_only", True),
-            cookies_from_browser=o.get("cookies") or None,
-            progress_cb=cb,
-        )
+        for attempt in range(DOWNLOAD_ATTEMPTS):
+            try:
+                return TV.download_video(
+                    job.source,
+                    audio_only=o.get("audio_only", True),
+                    cookies_from_browser=o.get("cookies") or None,
+                    progress_cb=cb,
+                )
+            except Exception as e:
+                # 只对 yt-dlp 的下载失败（download_video 包装成 RuntimeError）做整体重试，
+                # 其余异常（含取消）原样抛出。每次重试都会重新请求 playurl，
+                # 常会分配到比上次更健康的 CDN 节点，对 mcdn/PCDN 抖动特别有效。
+                if attempt == DOWNLOAD_ATTEMPTS - 1 or not isinstance(e, RuntimeError):
+                    raise
+                if job.stop_event.is_set():
+                    raise
+                job.message = (f"下载出错，{DOWNLOAD_RETRY_DELAY} 秒后重试"
+                               f"（{attempt + 1}/{DOWNLOAD_ATTEMPTS - 1}）…")
+                print(f"[download] 第 {attempt + 1}/{DOWNLOAD_ATTEMPTS} 次下载失败，"
+                      f"{DOWNLOAD_RETRY_DELAY} 秒后重试: {e}")
+                _sleep_cancellable(DOWNLOAD_RETRY_DELAY, job.stop_event)
+                job.message = "下载中…"
+        raise RuntimeError("下载失败：重试次数已用完")   # 防御：理论上循环内必 return 或 raise
     finally:
         if job.stop_event.is_set():
             raise _Cancelled()
@@ -267,6 +301,7 @@ def _worker_loop():
                 job.status = "error"
                 job.message = "失败"
                 job.error = f"{type(e).__name__}: {e}"
+                traceback.print_exc()        # 失败详情同步打印到控制台，便于排查
         finally:
             if job.finished is None:
                 job.finished = time.time()
