@@ -5,11 +5,12 @@ import tempfile
 import argparse
 from pathlib import Path
 
-sys.path.insert(0, r"C:\Users\jed\SenseVoice\SenseVoice-official")
+# SenseVoice 官方仓库的本地 checkout（项目根目录下），提供 model.py
+sys.path.insert(0, str(Path(__file__).resolve().parent / "SenseVoice-official"))
 import re
 import torch
 import soundfile as sf
-from model import SenseVoiceSmall
+from model import SenseVoiceSmall  # type: ignore  # 运行时经上方 sys.path 注入解析（外部 SenseVoice 目录），静态分析无法解析
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 
 
@@ -84,13 +85,90 @@ def transcribe_audio(audio_path, model, kwargs, language="zh", use_itn=True,
             )
         all_texts.append(rich_transcription_postprocess(res[0][0]["text"]))
 
-    clean = re.sub(r'[🎼]', '', "".join(all_texts))
+    # 过滤 SenseVoice 输出的情绪/事件 emoji（funasr 会把 <|ANGRY|>、<|BGM|> 等标记转成😡🎼👏等），
+    # 按 Unicode 表情符号区段整体过滤，比逐个枚举更稳
+    clean = re.sub(r'[\U0001F000-\U0001FFFF\uFE0F]', '', "".join(all_texts))
     return clean
 
 
 MODEL_DIR = r"C:\Users\jed\.cache\modelscope\hub\models\iic\SenseVoiceSmall"
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
 AUDIO_EXTENSIONS = {'.wav', '.mp3', '.flac', '.ogg', '.aac', '.m4a', '.wma'}
+DOWNLOAD_DIR = Path(__file__).resolve().parent / 'videos'
+
+
+def is_url(text):
+    """判断输入是否为视频网站链接。"""
+    return text.startswith(('http://', 'https://', 'www.'))
+
+
+def download_video(url, output_dir=DOWNLOAD_DIR, audio_only=False,
+                   cookies_from_browser=None):
+    """用 yt-dlp 从视频网站（YouTube、B站等数千个站点）下载视频/音频。
+
+    返回下载后的文件路径（Path）。文件保存到 output_dir（默认项目 videos/ 目录），
+    文件名格式: 标题 [视频ID].扩展名。
+
+    audio_only: 仅下载音轨，转录场景下载更快、占盘更小。
+    cookies_from_browser: 浏览器名称（chrome/firefox/edge 等），
+        用于需要登录的站点（如会员/ age-restricted 内容）。
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        print("错误: 未安装 yt-dlp，请先运行: pip install yt-dlp")
+        sys.exit(1)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            downloaded = d.get('downloaded_bytes', 0)
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            speed = d.get('speed')
+            speed_str = f" {speed / 1048576:.1f} MB/s" if speed else ""
+            if total:
+                print(f"\r下载中: {downloaded / 1048576:.1f}/{total / 1048576:.1f} MB"
+                      f"（{downloaded / total * 100:.1f}%）{speed_str}   ",
+                      end='', flush=True)
+            else:
+                print(f"\r下载中: {downloaded / 1048576:.1f} MB{speed_str}   ",
+                      end='', flush=True)
+        elif d['status'] == 'finished':
+            print("\n下载完成，正在合并/后处理...")
+
+    ydl_opts = {
+        'format': ('bestaudio/best' if audio_only else
+                   'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'),
+        'outtmpl': str(output_dir / '%(title).150s [%(id)s].%(ext)s'),
+        'windowsfilenames': True,   # Windows 下使用更保守的文件名清洗规则
+        'noplaylist': True,         # 传播放列表链接时只下载单个视频
+        'quiet': True,
+        'no_warnings': True,
+        'noprogress': True,         # 关闭 yt-dlp 自带进度条，用自定义 progress_hook
+        'progress_hooks': [progress_hook],
+    }
+    if not audio_only:
+        ydl_opts['merge_output_format'] = 'mp4'
+    if cookies_from_browser:
+        ydl_opts['cookiesfrombrowser'] = (cookies_from_browser,)
+
+    print("正在获取视频信息...")
+    from yt_dlp.utils import DownloadError
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore  # 官方 README 即以普通 dict 传参；_Params 为私有 TypedDict，无法静态构造
+            info = ydl.extract_info(url, download=True)
+            # requested_downloads[0]['filepath'] 是合并/后处理后的最终文件路径
+            filepath = info.get('requested_downloads', [{}])[0].get('filepath')
+            if not filepath:
+                filepath = ydl.prepare_filename(info)
+    except DownloadError as e:
+        raise RuntimeError(f"yt-dlp 下载失败: {e}") from e
+
+    print(f"下载完成: {filepath}")
+    return Path(filepath)
 
 
 def resolve_device(device="auto"):
@@ -107,8 +185,19 @@ def load_model(model_dir=MODEL_DIR, device="auto"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='视频/音频转文字工具')
-    parser.add_argument('input', help='输入视频或音频文件路径')
+    # 重定向/管道输出时 Windows 默认 GBK 编不了 emoji，降级为替换而非崩溃
+    # （reconfigure 只在 io.TextIOWrapper 上存在，用 getattr 兼容存根类型）
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if callable(reconfigure):
+            reconfigure(errors='replace')
+
+    parser = argparse.ArgumentParser(description='视频/音频转文字工具，支持直接传入视频网站 URL 自动下载')
+    parser.add_argument('input', help='输入视频/音频文件路径，或视频网站 URL（http(s):// 或 www. 开头）')
+    parser.add_argument('--audio-only', action='store_true',
+                        help='URL 下载时仅下载音轨（转录只需音频，下载更快）')
+    parser.add_argument('--cookies-from-browser', default=None, metavar='BROWSER',
+                        help='下载时从指定浏览器读取 cookies（chrome/firefox/edge 等，用于需登录的站点）')
     parser.add_argument('-o', '--output', help='输出文本文件路径（可选）')
     parser.add_argument('--device', default='auto', help='推理设备：auto / cuda:0 / cpu')
     parser.add_argument('--language', default='zh', help='语言：auto / zh / en / yue / ja / ko')
@@ -118,11 +207,22 @@ def main():
     parser.add_argument('--overlap', type=int, default=1, help='分块重叠（秒）')
     
     args = parser.parse_args()
-    
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"错误: 文件 '{input_path}' 不存在")
-        sys.exit(1)
+
+    if is_url(args.input):
+        try:
+            input_path = download_video(
+                args.input,
+                audio_only=args.audio_only,
+                cookies_from_browser=args.cookies_from_browser,
+            )
+        except RuntimeError as e:
+            print(f"\n错误: {e}")
+            sys.exit(1)
+    else:
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"错误: 文件 '{input_path}' 不存在")
+            sys.exit(1)
     
     is_video = input_path.suffix.lower() in VIDEO_EXTENSIONS
     is_audio = input_path.suffix.lower() in AUDIO_EXTENSIONS
@@ -137,6 +237,8 @@ def main():
     print(f"正在加载模型（{device}）...")
     m, kwargs = load_model(device=device)
     
+    temp_audio_path = None
+    cleanup_temp = False
     if is_video:
         print(f"正在从视频中提取音频: {input_path}")
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
@@ -172,7 +274,7 @@ def main():
         print(f"\n转录内容:\n{text}")
         
     finally:
-        if cleanup_temp and os.path.exists(temp_audio_path):
+        if cleanup_temp and temp_audio_path and os.path.exists(temp_audio_path):
             os.unlink(temp_audio_path)
 
 
