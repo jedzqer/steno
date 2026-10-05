@@ -45,7 +45,7 @@ python webui.py --port 9000 --no-browser
 ## 环境依赖
 
 - Windows + Python 3.13（代码兼容 3.8+）
-- **FFmpeg**：必须在 PATH 中（提取音频）
+- **FFmpeg**：必须在 PATH 中（提取音频、解码 m4a/aac 等 libsndfile 不支持的格式）
 - pip 包：`torch`、`soundfile`、`funasr`、`yt-dlp`（URL 下载）
 - 模型权重：`MODEL_DIR` 常量指向 `C:\Users\jed\.cache\modelscope\hub\models\iic\SenseVoiceSmall`，运行前必须已存在
 - GPU：自动检测 CUDA（`--device cpu` 可强制 CPU）
@@ -71,6 +71,11 @@ main()
 - **stdout 编码兜底**：main() 入口对 stdout/stderr 做 `reconfigure(errors='replace')`，避免重定向/管道输出时 GBK 无法编码 emoji 而崩溃
 
 ## 注意事项 / 已知坑
+
+- libsndfile（soundfile 底层）不支持 AAC/M4A/WMA 等格式，`sf.read` 会报 `Format not recognised`；
+  且 SenseVoice 要求 16kHz 输入。因此 `transcribe_audio()` 对 soundfile 读不出或非 16kHz 的音频
+  统一回落到 `decode_audio_with_ffmpeg()`（ffmpeg 管道解码 + 重采样到 16kHz），勿绕过；
+  否则 yt-dlp `--audio-only` 下载的 m4a（通常是 44.1kHz AAC）会在读取阶段直接失败
 
 - `videos/`、所有媒体文件和 `*_out.txt` 均被 gitignore，仓库里看不到测试产物是正常的
 - Windows 控制台（GBK 代码页）下直接 `print` emoji 会崩，已有 `errors='replace'` 兜底；测试时管道捕获的中文乱码是显示问题，不是 bug

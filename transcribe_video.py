@@ -8,6 +8,7 @@ from pathlib import Path
 # SenseVoice 官方仓库的本地 checkout（项目根目录下），提供 model.py
 sys.path.insert(0, str(Path(__file__).resolve().parent / "SenseVoice-official"))
 import re
+import numpy as np
 import torch
 import soundfile as sf
 from model import SenseVoiceSmall  # type: ignore  # 运行时经上方 sys.path 注入解析（外部 SenseVoice 目录），静态分析无法解析
@@ -38,6 +39,38 @@ def extract_audio_from_video(video_path, output_audio_path):
         return False
 
 
+SENSEVOICE_SR = 16000   # SenseVoiceSmall 模型要求的音频采样率
+
+
+def decode_audio_with_ffmpeg(audio_path, sr=SENSEVOICE_SR):
+    """用 ffmpeg 将任意音频/视频解码为 sr 采样率、单声道的 float32 PCM 波形。
+
+    libsndfile（soundfile 底层）不支持 AAC/M4A 等 yt-dlp 常见下载格式
+    （sf.read 会报 Format not recognised），此类文件必须经 ffmpeg 解码；
+    同时统一重采样到模型要求的 16kHz。返回 (numpy.float32 波形, 采样率)。
+    """
+    cmd = [
+        'ffmpeg', '-nostdin', '-v', 'error',
+        '-i', str(audio_path),
+        '-vn',
+        '-acodec', 'pcm_f32le',
+        '-ac', '1',
+        '-ar', str(sr),
+        '-f', 'f32le', 'pipe:1',
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, check=True)
+    except FileNotFoundError as e:
+        raise RuntimeError("错误: 未找到ffmpeg，请确保已安装ffmpeg并添加到PATH环境变量中") from e
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b'').decode(errors='replace').strip()
+        raise RuntimeError(f"ffmpeg 解码音频失败: {stderr}") from e
+    data = np.frombuffer(result.stdout, dtype=np.float32).copy()
+    if data.size == 0:
+        raise RuntimeError(f"ffmpeg 未能从 '{audio_path}' 解出任何音频数据")
+    return data, sr
+
+
 class TranscriptionCancelled(Exception):
     """转录被用户取消时抛出。"""
     pass
@@ -51,9 +84,17 @@ def transcribe_audio(audio_path, model, kwargs, language="zh", use_itn=True,
     progress_cb(index, total, name): 每完成一段回调一次。
     stop_event(threading.Event): 置位时取消转录。
     """
-    data, sr = sf.read(audio_path, dtype='float32')
-    if len(data.shape) > 1:
-        data = data.mean(axis=1)
+    # libsndfile 不支持 m4a/aac 等格式（报 Format not recognised），且模型要求 16kHz：
+    # soundfile 读不出、或采样率非 16kHz 的音频统一回落到 ffmpeg 解码 + 重采样
+    data = sr = None
+    try:
+        data, sr = sf.read(audio_path, dtype='float32')
+        if len(data.shape) > 1:
+            data = data.mean(axis=1)
+    except RuntimeError:            # soundfile 的 LibsndfileError 等均继承 RuntimeError
+        data = sr = None
+    if data is None or sr != SENSEVOICE_SR:
+        data, sr = decode_audio_with_ffmpeg(audio_path)
     waveform = torch.from_numpy(data)
 
     chunk_len = chunk_sec * sr
