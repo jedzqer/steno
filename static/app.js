@@ -63,7 +63,7 @@ const ICON = {
 
 // ============================ 工具 ============================
 function fmtBytes(n) {
-  if (n == null || isNaN(n)) return '';
+  if (n == null || Number.isNaN(n)) return '';
   const u = ['B', 'KB', 'MB', 'GB']; let i = 0;
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
   return (i === 0 || n >= 100 ? Math.round(n) : n.toFixed(1)) + ' ' + u[i];
@@ -94,15 +94,32 @@ async function api(path, opts = {}) {
   const r = await fetch(path, opts);
   if (!r.ok) {
     let msg = `${r.status} ${r.statusText}`;
-    try { msg = (await r.json()).detail || msg; } catch { /* ignore */ }
+    try { const body = await r.json(); msg = body.detail || msg; } catch { /* ignore */ }
     throw new Error(msg);
   }
   return r.json();
 }
 
+// 纯文本接口（/api/history/content 返回 PlainTextResponse，不能按 JSON 解析）
+async function apiText(path) {
+  const r = await fetch(path);
+  if (!r.ok) {
+    let msg = `${r.status} ${r.statusText}`;
+    try { const body = await r.json(); msg = body.detail || msg; } catch { /* ignore */ }
+    throw new Error(msg);
+  }
+  return r.text();
+}
+
 // ============================ 系统状态 ============================
 function chipEl(label, type) {
   return h('span', { class: `chip ${type}` }, h('i'), label);
+}
+function startHintText(i) {
+  if (!i.backend_ok) return '后端依赖缺失，请先安装 torch / funasr';
+  if (!i.model_loaded && i.model_dir_exists) return '首次转录需先加载模型，约需十几秒';
+  if (!i.ffmpeg) return '未检测到 FFmpeg，视频文件将无法提取音频';
+  return '';
 }
 function renderInfo() {
   const i = state.info;
@@ -119,12 +136,7 @@ function renderInfo() {
   chips.push(chipEl('FFmpeg', i.ffmpeg ? 'ok' : 'err'));
   chips.push(chipEl('yt-dlp', i.yt_dlp ? 'ok' : 'err'));
   $('#sysChips').replaceChildren(...chips);
-  $('#startHint').replaceChildren(
-    !i.backend_ok ? '后端依赖缺失，请先安装 torch / funasr'
-    : !i.model_loaded && i.model_dir_exists ? '首次转录需先加载模型，约需十几秒'
-    : !i.ffmpeg ? '未检测到 FFmpeg，视频文件将无法提取音频'
-    : ''
-  );
+  $('#startHint').replaceChildren(startHintText(i));
 }
 async function loadInfo() {
   try { state.info = await api('/api/info'); renderInfo(); } catch { /* 忽略 */ }
@@ -239,7 +251,9 @@ function stepperEl(job) {
   const cur = stages.indexOf(job.stage);
   const parts = [];
   stages.forEach((s, i) => {
-    const cls = i < cur ? 'done' : (i === cur ? 'active' : '');
+    let cls = '';
+    if (i < cur) cls = 'done';
+    else if (i === cur) cls = 'active';
     parts.push(h('div', { class: `step ${cls}` },
       h('span', { class: 'dot', text: i < cur ? '✓' : '' }),
       h('span', { class: 'lbl', text: STAGE_LABEL[s] })));
@@ -327,7 +341,7 @@ function renderJobs() {
 // ============================ 结果面板 ============================
 async function showResult(name, title) {
   try {
-    const text = await api('/api/history/content?name=' + encodeURIComponent(name));
+    const text = await apiText('/api/history/content?name=' + encodeURIComponent(name));
     state.result = { name, title: title || name.replace(/_out\.txt$/, ''), text };
     $('#resultTitle').textContent = '转录结果 · ' + state.result.title;
     $('#resultText').textContent = text;
@@ -339,9 +353,11 @@ async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
   } catch {
-    const ta = document.createElement('textarea');   // 非安全上下文兜底
-    ta.value = text; document.body.appendChild(ta);
-    ta.select(); document.execCommand('copy'); ta.remove();
+    // 非安全上下文（HTTP）兜底：execCommand 虽已标记弃用，仍是 Clipboard API 不可用时唯一方案
+    const ta = document.createElement('textarea');
+    const legacyDoc = /** @type {any} */ (document);
+    ta.value = text; document.body.append(ta);
+    ta.select(); legacyDoc.execCommand('copy'); ta.remove();
   }
   toast('已复制到剪贴板');
 }
@@ -357,7 +373,8 @@ function downloadText(name, text) {
 // ============================ 历史记录 ============================
 const extClass = title => {
   const e = extOf(title);
-  return VIDEO_EXT.includes(e) ? 'video' : AUDIO_EXT.includes(e) ? 'audio' : 'other';
+  if (VIDEO_EXT.includes(e)) return 'video';
+  return AUDIO_EXT.includes(e) ? 'audio' : 'other';
 };
 function histCardEl(item) {
   return h('div', { class: 'hist-card', 'data-hist': item.name },
@@ -391,7 +408,7 @@ async function loadHistory() {
 let modalName = null;
 async function openModal(name) {
   try {
-    const text = await api('/api/history/content?name=' + encodeURIComponent(name));
+    const text = await apiText('/api/history/content?name=' + encodeURIComponent(name));
     modalName = name;
     const item = state.history.find(x => x.name === name);
     $('#modalTitle').textContent = item ? item.title : name.replace(/_out\.txt$/, '');
