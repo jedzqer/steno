@@ -2,6 +2,8 @@
 
 基于 [SenseVoiceSmall](https://github.com/FunAudioLLM/SenseVoice) 模型的速记工具，支持视频提取音频并转录为文字。
 
+![Steno 网页界面](docs/screenshot-webui.png)
+
 ## 环境要求
 
 - Python 3.8+
