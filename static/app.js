@@ -16,6 +16,9 @@ const state = {
   file: null,            // File 对象
   jobs: [],              // 服务端任务列表（新→旧）
   prevStatus: {},        // 任务状态快照，用于检测完成沿
+  watching: new Set(),   // 本次会话提交的任务 id：首次观测即 done 也要报完成
+  notifiedDone: new Set(), // 已提示过终态的任务 id，防重复提示
+  submitting: false,     // URL 任务提交进行中（防重复提交）
   uploading: null,       // {name, loaded, total, xhr}
   result: null,          // {name, title, text}
   history: [],
@@ -188,8 +191,12 @@ function collectOpts(fd) {
   fd.append('overlap', Math.max(0, Math.min(30, +$('#overlap').value || 1)));
   return fd;
 }
+function setStartDisabled(disabled) { $('#startBtn').disabled = disabled; }
+function watchJob(id) { if (id) state.watching.add(id); }
 function startJob() {
   if (state.serverDown) { toast('服务已停止，请重新启动 webui.py', 'err'); return; }
+  if (state.uploading) { toast('正在上传文件，请等待完成或取消上传', 'warn'); return; }
+  if (state.submitting) { toast('正在提交，请稍候…', 'warn'); return; }
   if (state.tab === 'file') {
     if (!state.file) { toast('请先选择或拖放文件', 'warn'); return; }
     uploadFile();
@@ -199,9 +206,12 @@ function startJob() {
     const fd = collectOpts(new FormData());
     fd.append('mode', 'url');
     fd.append('url', url);
+    state.submitting = true;
+    setStartDisabled(true);
     api('/api/jobs', { method: 'POST', body: fd })
-      .then(afterSubmit)
-      .catch(e => toast(e.message, 'err'));
+      .then(res => { watchJob(res.id); afterSubmit(); })
+      .catch(e => toast(e.message, 'err'))
+      .finally(() => { state.submitting = false; setStartDisabled(false); });
   }
 }
 function uploadFile() {
@@ -210,6 +220,7 @@ function uploadFile() {
   fd.append('file', state.file);
   const xhr = new XMLHttpRequest();
   state.uploading = { name: state.file.name, loaded: 0, total: state.file.size, xhr };
+  setStartDisabled(true);
   renderJobs();
   xhr.open('POST', '/api/jobs');
   xhr.upload.onprogress = e => {
@@ -220,24 +231,30 @@ function uploadFile() {
   };
   xhr.onload = () => {
     state.uploading = null;
-    if (xhr.status >= 200 && xhr.status < 300) { afterSubmit(); }
-    else {
+    setStartDisabled(false);
+    if (xhr.status >= 200 && xhr.status < 300) {
+      try { watchJob(JSON.parse(xhr.responseText).id); } catch { /* ignore */ }
+      afterSubmit();
+    } else {
       let msg = xhr.statusText;
       try { msg = JSON.parse(xhr.responseText).detail || msg; } catch { /* ignore */ }
       toast('上传失败：' + msg, 'err');
       renderJobs();
     }
   };
-  xhr.onerror = () => { state.uploading = null; renderJobs(); toast('上传失败：网络错误', 'err'); };
+  xhr.onerror = () => { state.uploading = null; setStartDisabled(false); renderJobs(); toast('上传失败：网络错误', 'err'); };
+  xhr.onabort = () => { state.uploading = null; setStartDisabled(false); renderJobs(); };
   xhr.send(fd);
 }
 function afterSubmit() {
   clearFile();
   $('#urlInput').value = '';
   toast('已加入任务队列');
+  hideResult();                 // 新任务开始，清掉面板里残留的上一条结果
+  requestNotifyPermission();    // 借用户手势申请系统通知权限
   renderJobs();
   loadInfo();
-  ensurePolling();
+  pollNow();                    // 立即轮询：模型已缓存时任务可能几秒内完成
 }
 
 // ============================ 任务渲染 ============================
@@ -309,6 +326,10 @@ function jobRowEl(job) {
     (job.status === 'done' && job.result)
       ? h('button', { class: 'ghost-btn mini-btn', text: '查看', 'data-view-result': job.id })
       : null,
+    (job.status === 'done' && job.result)
+      ? h('button', { class: 'ghost-btn mini-btn', 'data-copy-job': job.id },
+          h('span', { class: 'btn-label', text: '复制' }))
+      : null,
     h('button', { class: 'icon-btn', title: '从列表移除', 'data-del-job': job.id }, ICON.close()));
 }
 function uploadCardEl(u) {
@@ -317,7 +338,8 @@ function uploadCardEl(u) {
     h('div', { class: 'job-head' },
       h('span', { class: 'spin' }),
       h('b', { text: u.name, title: u.name }),
-      h('span', { class: 'pill run', text: '上传中' })),
+      h('span', { class: 'pill run', text: '上传中' }),
+      h('button', { class: 'ghost-btn mini-btn', text: '取消上传', 'data-cancel-upload': '1' })),
     h('div', { class: 'bar' }, h('div', { class: 'bar-fill', style: `width:${pct}%` })),
     h('div', { class: 'job-meta' },
       h('span', { text: `${fmtBytes(u.loaded)} / ${fmtBytes(u.total)} · ${pct}%` })));
@@ -326,7 +348,7 @@ function renderJobs() {
   const wrap = $('#jobsWrap');
   const u = state.uploading;
   const active = state.jobs.filter(j => j.status === 'queued' || j.status === 'running');
-  const recent = state.jobs.filter(j => j.status !== 'queued' && j.status !== 'running').slice(0, 6);
+  const recent = state.jobs.filter(j => j.status !== 'queued' && j.status !== 'running');   // 不截断：完成任务的“查看/复制”入口不能在第 7 条后消失
 
   if (!u && !active.length && !recent.length) { wrap.classList.add('hidden'); return; }
   wrap.classList.remove('hidden');
@@ -339,27 +361,76 @@ function renderJobs() {
 }
 
 // ============================ 结果面板 ============================
+function setExpanded(expanded) {
+  $('#resultCard').classList.toggle('expanded', expanded);
+  $('#expandLabel').textContent = expanded ? '收起' : '展开全文';
+}
+function hideResult() {
+  state.result = null;
+  setExpanded(false);
+  $('#resultWrap').classList.add('hidden');
+}
 async function showResult(name, title) {
   try {
+    if (state.view !== 'new') switchView('new');   // 结果面板在“新建转录”视图内，先切过去再展示
     const text = await apiText('/api/history/content?name=' + encodeURIComponent(name));
     state.result = { name, title: title || name.replace(/_out\.txt$/, ''), text };
     $('#resultTitle').textContent = '转录结果 · ' + state.result.title;
     $('#resultText').textContent = text;
     $('#charCount').textContent = `共 ${text.length} 字`;
+    setExpanded(false);
     $('#resultWrap').classList.remove('hidden');
   } catch (e) { toast('读取结果失败：' + e.message, 'err'); }
 }
-async function copyText(text) {
+async function copyJobResult(name, btn) {
   try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    // 非安全上下文（HTTP）兜底：execCommand 虽已标记弃用，仍是 Clipboard API 不可用时唯一方案
-    const ta = document.createElement('textarea');
-    const legacyDoc = /** @type {any} */ (document);
-    ta.value = text; document.body.append(ta);
-    ta.select(); legacyDoc.execCommand('copy'); ta.remove();
+    const text = await apiText('/api/history/content?name=' + encodeURIComponent(name));
+    await copyText(text, btn);
+  } catch (e) { toast('读取结果失败：' + e.message, 'err'); }
+}
+async function copyText(text, btn = null) {
+  if (!text) { toast('没有可复制的内容', 'warn'); return; }
+  const ok = await writeClipboard(text);
+  if (ok) {
+    toast('已复制到剪贴板');
+    flashCopied(btn);
+  } else {
+    // 不再把失败伪装成成功：粘贴出来是空的比提示失败更糟
+    toast('复制失败，请手动选中文本复制', 'err');
   }
-  toast('已复制到剪贴板');
+}
+async function writeClipboard(text) {
+  // Clipboard API 仅安全上下文可用（localhost 视为安全；--host 0.0.0.0 用局域网 IP 访问时不可用）
+  if (window.isSecureContext && navigator.clipboard) {
+    try { await navigator.clipboard.writeText(text); return true; }
+    catch { /* 窗口失焦等场景会 reject，回落 execCommand */ }
+  }
+  try { return legacyCopy(text); } catch { return false; }
+}
+function legacyCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  // 离屏 + 只读：避免 focus 造成页面跳动 / 移动端弹键盘，也不破坏用户已有选区
+  ta.style.cssText = 'position:fixed;top:0;left:-9999px;width:1px;height:1px;opacity:0;';
+  document.body.append(ta);
+  const sel = document.getSelection();
+  const saved = sel.rangeCount ? sel.getRangeAt(0) : null;
+  ta.select();
+  ta.setSelectionRange(0, text.length);
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch { ok = false; }
+  ta.remove();
+  if (saved) { sel.removeAllRanges(); sel.addRange(saved); }
+  return ok;
+}
+function flashCopied(btn) {
+  const label = btn && btn.querySelector('.btn-label');
+  if (!label || label.dataset.flash) return;
+  label.dataset.flash = '1';
+  const prev = label.textContent;
+  label.textContent = '已复制 ✓';
+  setTimeout(() => { label.textContent = prev; delete label.dataset.flash; }, 1500);
 }
 function downloadText(name, text) {
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
@@ -385,14 +456,25 @@ function histCardEl(item) {
         (item.media ? ` · 源文件 ${fmtBytes(item.media_size)}` : '') })),
     h('span', { class: 'hc-arrow', text: '→' }));
 }
-function renderHistory() {
-  const q = $('#histSearch').value.trim().toLowerCase();
-  const items = state.history.filter(x => !q || x.title.toLowerCase().includes(q));
+let histSearchTimer = null;
+let histSearchSeq = 0;
+async function renderHistory() {
+  const q = $('#histSearch').value.trim();
   $('#histCount').textContent = state.history.length || '';
+  const seq = ++histSearchSeq;
+  let items = state.history;
+  if (q) {
+    // 正文搜索交给服务端（/api/history?q=），避免把所有记录全文拉到前端
+    try {
+      const found = await api('/api/history?q=' + encodeURIComponent(q));
+      if (seq !== histSearchSeq) return;   // 已有更新的搜索输入，丢弃过期响应
+      items = found;
+    } catch { return; }                    // 服务停止时静默
+  }
   if (!items.length) {
     $('#histGrid').replaceChildren(h('div', { class: 'empty' },
       svgIcon([['circle', { cx: 12, cy: 12, r: 8.5 }], ['path', { d: 'M12 7.5V12l3 2' }]], 1.5),
-      h('div', { text: q ? '没有匹配的记录' : '还没有转录记录，去创建第一个吧' })));
+      h('div', { text: q ? '没有匹配的记录（文件名与正文都会搜索）' : '还没有转录记录，去创建第一个吧' })));
     return;
   }
   $('#histGrid').replaceChildren(...items.map(histCardEl));
@@ -421,12 +503,38 @@ async function openModal(name) {
 function closeModal() { $('#modal').classList.add('hidden'); modalName = null; }
 
 // ============================ 轮询 ============================
+function notifyDone(job) {
+  if (!document.hidden) return;
+  document.title = '✓ 转录完成 — steno';       // 标题角标：切到后台也能注意到
+  if ('Notification' in window && Notification.permission === 'granted') {
+    try {
+      const n = new Notification('转录完成 ✓', { body: job.display, tag: 'steno-job-done' });
+      n.addEventListener('click', () => { window.focus(); n.close(); });
+    } catch { /* 某些环境构造 Notification 会抛错，忽略 */ }
+  }
+}
+function requestNotifyPermission() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    try { Notification.requestPermission(); } catch { /* ignore */ }
+  }
+}
+function isDoneEdge(j, prev) {
+  // 完成沿判定：本会话提交的任务（首次观测即 done 也算——模型已缓存时短音频
+  // 几秒内完成，第一次轮询就可能直接拿到 done），或列表中经历了
+  // queued/running → done 转变的任务。
+  return j.status === 'done' && !state.notifiedDone.has(j.id) &&
+    (state.watching.has(j.id) || (prev && prev !== 'done'));
+}
 function onJobDone(job) {
   toast('转录完成 ✓');
   loadHistory();
   loadInfo();
-  if (job.result) showResult(job.result, job.display);
-  setTimeout(() => $('#resultWrap').scrollIntoView({ behavior: 'smooth', block: 'start' }), 120);
+  notifyDone(job);
+  if (job.result) {
+    // showResult 内部会切视图/拉取全文，完成后再滚动到结果面板
+    showResult(job.result, job.display)
+      .then(() => $('#resultWrap').scrollIntoView({ behavior: 'smooth', block: 'start' }));
+  }
 }
 function pollOnce() {
   const hadWork = state.uploading ||
@@ -434,11 +542,23 @@ function pollOnce() {
   api('/api/jobs').then(jobs => {
     state.pollFail = 0;
     if (state.serverDown) { state.serverDown = false; toast('服务已恢复'); }
+    const seen = new Set(jobs.map(j => j.id));
     for (const j of jobs) {
       const prev = state.prevStatus[j.id];
-      if (j.status === 'done' && prev && prev !== 'done') onJobDone(j);
+      if (isDoneEdge(j, prev)) {
+        state.notifiedDone.add(j.id);
+        onJobDone(j);
+      } else if (j.status === 'error' && !state.notifiedDone.has(j.id) &&
+                 (state.watching.has(j.id) || (prev && prev !== 'error'))) {
+        state.notifiedDone.add(j.id);
+        toast('转录失败：' + (j.error || '未知错误'), 'err');
+      }
       state.prevStatus[j.id] = j.status;
     }
+    // 清理已从服务端消失的任务（被删除/服务重启），防止快照无限增长
+    for (const id of Object.keys(state.prevStatus)) if (!seen.has(id)) delete state.prevStatus[id];
+    for (const id of [...state.notifiedDone]) if (!seen.has(id)) state.notifiedDone.delete(id);
+    for (const id of [...state.watching]) if (!seen.has(id)) state.watching.delete(id);
     state.jobs = jobs;
     renderJobs();
     schedulePoll(hadWork || jobs.some(j => j.status === 'queued' || j.status === 'running'));
@@ -455,8 +575,9 @@ function schedulePoll(active) {
   clearTimeout(state.pollTimer);
   state.pollTimer = setTimeout(pollOnce, active ? 1100 : 4000);
 }
-function ensurePolling() {
-  if (state.pollTimer) return;
+function pollNow() {
+  // 清掉待触发的定时器立即轮询：提交任务后必须马上看一眼，不能等下一周期
+  clearTimeout(state.pollTimer);
   pollOnce();
 }
 
@@ -488,6 +609,12 @@ function bind() {
 
   // 任务列表（事件委托）
   $('#jobList').addEventListener('click', e => {
+    // 取消上传（abort XHR，onabort 里清理状态并重新渲染）
+    if (e.target.closest('[data-cancel-upload]')) {
+      const u = state.uploading;
+      if (u) { u.xhr.abort(); toast('已取消上传', 'warn'); }
+      return;
+    }
     const cancelId = e.target.closest('[data-cancel]')?.dataset.cancel;
     if (cancelId) {
       api(`/api/jobs/${cancelId}/cancel`, { method: 'POST' })
@@ -501,22 +628,37 @@ function bind() {
       if (job?.result) showResult(job.result, job.display);
       return;
     }
+    const copyId = e.target.closest('[data-copy-job]')?.dataset.copyJob;
+    if (copyId) {
+      const job = state.jobs.find(j => j.id === copyId);
+      if (job?.result) copyJobResult(job.result, e.target.closest('[data-copy-job]'));
+      return;
+    }
     const delId = e.target.closest('[data-del-job]')?.dataset.delJob;
     if (delId) {
       api(`/api/jobs/${delId}`, { method: 'DELETE' })
-        .then(() => { delete state.prevStatus[delId]; pollOnce(); })
+        .then(() => {
+          delete state.prevStatus[delId];
+          state.watching.delete(delId);
+          state.notifiedDone.delete(delId);
+          pollOnce();
+        })
         .catch(err => toast(err.message, 'err'));
     }
   });
 
   // 结果操作
-  $('#copyBtn').addEventListener('click', () => copyText(state.result ? state.result.text : ''));
+  $('#copyBtn').addEventListener('click', e => copyText(state.result ? state.result.text : '', e.currentTarget));
+  $('#expandBtn').addEventListener('click', () => setExpanded(!$('#resultCard').classList.contains('expanded')));
   $('#dlBtn').addEventListener('click', () => {
     if (state.result) downloadText(state.result.name, state.result.text);
   });
 
   // 历史
-  $('#histSearch').addEventListener('input', renderHistory);
+  $('#histSearch').addEventListener('input', () => {
+    clearTimeout(histSearchTimer);
+    histSearchTimer = setTimeout(renderHistory, 250);   // 正文搜索在服务端做，去抖后再请求
+  });
   $('#histGrid').addEventListener('click', e => {
     const card = e.target.closest('[data-hist]');
     if (card) openModal(card.dataset.hist);
@@ -526,7 +668,7 @@ function bind() {
   $('#modalClose').addEventListener('click', closeModal);
   $('#modal').addEventListener('click', e => { if (e.target === $('#modal')) closeModal(); });
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
-  $('#modalCopy').addEventListener('click', () => copyText($('#modalText').textContent));
+  $('#modalCopy').addEventListener('click', e => copyText($('#modalText').textContent, e.currentTarget));
   $('#modalDl').addEventListener('click', () => { if (modalName) downloadText(modalName, $('#modalText').textContent); });
   $('#modalDelete').addEventListener('click', () => {
     if (!modalName) return;
@@ -552,12 +694,18 @@ function bind() {
   });
 
   $('#footUrl').textContent = location.host;
+
+  // 回到页面时清掉完成提示的标题角标
+  const baseTitle = document.title;
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) document.title = baseTitle;
+  });
 }
 
 // ============================ 启动 ============================
 bind();
 loadInfo();
 loadHistory();
-ensurePolling();
+pollNow();
 
 })();

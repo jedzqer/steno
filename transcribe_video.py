@@ -2,6 +2,8 @@ import sys
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import argparse
 from pathlib import Path
 
@@ -15,8 +17,17 @@ from model import SenseVoiceSmall  # type: ignore  # 运行时经上方 sys.path
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 
 
-def extract_audio_from_video(video_path, output_audio_path):
-    """使用ffmpeg从视频中提取音频"""
+class TranscriptionCancelled(Exception):
+    """转录被用户取消时抛出。"""
+    pass
+
+
+def extract_audio_from_video(video_path, output_audio_path, stop_event=None):
+    """使用 ffmpeg 从视频中提取音频（16kHz 单声道 pcm_s16le）。
+
+    stop_event: 可选 threading.Event。置位时立即 kill ffmpeg 并抛出
+    TranscriptionCancelled，让 WebUI 的“提取音频”阶段可以即时取消。
+    """
     cmd = [
         'ffmpeg',
         '-i', video_path,
@@ -27,16 +38,53 @@ def extract_audio_from_video(video_path, output_audio_path):
         '-y',
         output_audio_path
     ]
-    
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"ffmpeg错误: {e.stderr}")
-        return False
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE,
+                                text=True, encoding='utf-8', errors='replace')
     except FileNotFoundError:
         print("错误: 未找到ffmpeg，请确保已安装ffmpeg并添加到PATH环境变量中")
         return False
+
+    # 后台线程持续排空 stderr，避免管道缓冲区写满导致 ffmpeg 卡死
+    stderr_chunks = []
+
+    def _drain(stream):
+        try:
+            stderr_chunks.append(stream.read())
+        except Exception:
+            pass
+
+    stderr_pipe = proc.stderr
+    drain = None
+    if stderr_pipe is not None:      # stderr=PIPE 启动，必定存在；仅为类型收窄
+        drain = threading.Thread(target=_drain, args=(stderr_pipe,), daemon=True)
+        drain.start()
+    try:
+        ret = None
+        while True:
+            ret = proc.poll()
+            if ret is not None:
+                break
+            if stop_event is not None and stop_event.is_set():
+                proc.kill()
+                proc.wait()
+                raise TranscriptionCancelled("音频提取已被用户取消")
+            time.sleep(0.1)
+        if drain is not None:
+            drain.join(timeout=2)
+        if ret != 0:
+            print(f"ffmpeg错误: {''.join(stderr_chunks)[:2000]}")
+            return False
+        return True
+    finally:
+        if proc.poll() is None:      # 防御：任何异常路径都确保子进程被回收
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
 
 SENSEVOICE_SR = 16000   # SenseVoiceSmall 模型要求的音频采样率
@@ -71,15 +119,50 @@ def decode_audio_with_ffmpeg(audio_path, sr=SENSEVOICE_SR):
     return data, sr
 
 
-class TranscriptionCancelled(Exception):
-    """转录被用户取消时抛出。"""
-    pass
+_PUNCT_RE = re.compile(r'[\s\W_]+', re.UNICODE)
+
+
+def _significant_text(s):
+    """去掉空白与标点后的有效字符序列，用于跨分块重叠区比对。"""
+    return _PUNCT_RE.sub('', s)
+
+
+def _merge_overlapped(prev_text, next_text, max_overlap_chars):
+    """合并相邻分块的转录文本，剪掉后块头部与前块尾部重复的重叠区内容。
+
+    分块按 stride 滑动时，相邻两块有 overlap_sec 秒的重叠音频，同一段话会被
+    转录两次，直接拼接会在边界处出现重复字词。这里将两侧文本做“去空白/标点”
+    归一化后，寻找最长的 尾部==头部 重复（至少 2 个有效字符，避免单字巧合），
+    再映射回原文定位截断点；找不到匹配就原样拼接——宁可重复，也不误删。
+    """
+    if max_overlap_chars <= 0 or not prev_text or not next_text:
+        return prev_text + next_text
+    p, c = _significant_text(prev_text), _significant_text(next_text)
+    limit = min(len(p), len(c), max_overlap_chars)
+    matched = 0
+    for k in range(limit, 1, -1):
+        if p.endswith(c[:k]):
+            matched = k
+            break
+    if not matched:
+        return prev_text + next_text
+    count = 0
+    for idx, ch in enumerate(next_text):
+        if not _PUNCT_RE.fullmatch(ch):
+            count += 1
+            if count == matched:
+                rest = re.sub(r'^[\s\W_]+', '', next_text[idx + 1:])
+                return prev_text + rest
+    return prev_text + next_text
 
 
 def transcribe_audio(audio_path, model, kwargs, language="zh", use_itn=True,
                      ban_emo_unk=False, chunk_sec=120, overlap_sec=1,
                      progress_cb=None, stop_event=None):
     """转录音频文件为文本。
+
+    分块按 stride 滑动、相邻块带 overlap_sec 重叠：重叠区语音被转录两次，
+    拼接时按“去标点/空白后的最长尾首重复”剪掉后块头部，避免边界处重复字词。
 
     progress_cb(index, total, name): 每完成一段回调一次。
     stop_event(threading.Event): 置位时取消转录。
@@ -107,7 +190,8 @@ def transcribe_audio(audio_path, model, kwargs, language="zh", use_itn=True,
         if end == waveform.shape[0]:
             break
 
-    all_texts = []
+    max_overlap_chars = 0 if overlap_sec <= 0 else min(400, overlap_sec * 20 + 10)
+    merged = ''
     name = Path(audio_path).stem
     for i, seg in enumerate(segments):
         if stop_event is not None and stop_event.is_set():
@@ -124,11 +208,12 @@ def transcribe_audio(audio_path, model, kwargs, language="zh", use_itn=True,
                 ban_emo_unk=ban_emo_unk,
                 **kwargs,
             )
-        all_texts.append(rich_transcription_postprocess(res[0][0]["text"]))
+        merged = _merge_overlapped(merged, rich_transcription_postprocess(res[0][0]["text"]),
+                                   max_overlap_chars)
 
     # 过滤 SenseVoice 输出的情绪/事件 emoji（funasr 会把 <|ANGRY|>、<|BGM|> 等标记转成😡🎼👏等），
     # 按 Unicode 表情符号区段整体过滤，比逐个枚举更稳
-    clean = re.sub(r'[\U0001F000-\U0001FFFF\uFE0F]', '', "".join(all_texts))
+    clean = re.sub(r'[\U0001F000-\U0001FFFF\uFE0F]', '', merged)
     return clean
 
 

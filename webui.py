@@ -7,7 +7,7 @@
   - 后台单 worker 队列依次转录，实时展示 下载/提取音频/转录 进度
   - 任务取消、失败原因展示
   - 历史记录（videos/*_out.txt）浏览 / 查看 / 删除
-  - 模型进程内缓存，只加载一次
+  - 模型进程内缓存（按推理设备各缓存一份，切换 GPU/CPU 真实生效）
 
 完全复用 transcribe_video.py 的下载 / 提取 / 转录逻辑，不重复实现。
 """
@@ -124,8 +124,7 @@ class Job:
 
 JOBS: dict[str, Job] = {}
 JOB_QUEUE: "queue.Queue[str]" = queue.Queue()
-_MODEL = None
-_MODEL_KWARGS = None
+_MODELS: dict[str, tuple] = {}      # 解析后的设备名 -> (model, kwargs)
 _MODEL_LOCK = threading.Lock()
 
 
@@ -135,14 +134,14 @@ def _check_cancel(job: Job):
 
 
 def _ensure_model(device: str):
-    """进程内缓存模型，整个 WebUI 生命周期只加载一次。"""
-    global _MODEL, _MODEL_KWARGS
+    """按推理设备缓存模型：同一设备只加载一次；切换 GPU/CPU 会真实生效。"""
     if TV is None:
         raise RuntimeError(f"后端依赖不可用，无法转录：{TV_ERROR}")
+    resolved = TV.resolve_device(device)
     with _MODEL_LOCK:
-        if _MODEL is None:
-            _MODEL, _MODEL_KWARGS = TV.load_model(device=device)
-        return _MODEL, _MODEL_KWARGS
+        if resolved not in _MODELS:
+            _MODELS[resolved] = TV.load_model(device=resolved)
+        return _MODELS[resolved]
 
 
 DOWNLOAD_ATTEMPTS = 3        # 下载总尝试次数（首次 + 2 次整体重试）
@@ -236,7 +235,22 @@ def _run_job(job: Job):
         job.stage, job.message, job.progress = "extract", "提取音频…", None
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             temp_audio = f.name
-        if not TV.extract_audio_from_video(str(input_path), temp_audio):
+        try:
+            # transcribe_video.extract_audio_from_video(..., stop_event=...) 会在取消时
+            # kill ffmpeg 并抛出 TranscriptionCancelled，使本阶段取消即时生效。
+            ok = TV.extract_audio_from_video(str(input_path), temp_audio,
+                                             stop_event=job.stop_event)
+        except TV.TranscriptionCancelled:    # 取消即时生效：ffmpeg 进程已被 kill
+            _cleanup_temp(temp_audio)
+            temp_audio = None
+            raise _Cancelled() from None
+        except BaseException:                 # 其它失败也要清掉半成品 wav
+            _cleanup_temp(temp_audio)
+            temp_audio = None
+            raise
+        if not ok:
+            _cleanup_temp(temp_audio)
+            temp_audio = None
             raise RuntimeError("ffmpeg 提取音频失败（请确认 ffmpeg 已加入 PATH）")
         audio_path = temp_audio
     else:
@@ -268,16 +282,13 @@ def _run_job(job: Job):
         if not text.strip():
             raise RuntimeError("转录结果为空（音频可能没有可识别的语音）")
 
-        out_path = input_path.with_name(f"{input_path.stem}_out.txt")
+        out_path = _unique_out_path(input_path)   # 重名不静默覆盖，追加 (2)/(3)…
         out_path.write_text(text, encoding="utf-8")
         job.result_name = out_path.name
         job.status, job.message, job.progress = "done", "完成", 1.0
     finally:
         if temp_audio:
-            try:
-                os.unlink(temp_audio)
-            except OSError:
-                pass
+            _cleanup_temp(temp_audio)
 
 
 def _worker_loop():
@@ -331,6 +342,25 @@ def _unique_dest(directory: Path, filename: str) -> Path:
     raise HTTPException(400, "文件名冲突过多")
 
 
+def _cleanup_temp(path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _unique_out_path(input_path: Path) -> Path:
+    """转录结果输出路径；重名时追加 (2)/(3)…，不静默覆盖旧结果。"""
+    base = input_path.with_name(f"{input_path.stem}_out.txt")
+    if not base.exists():
+        return base
+    for i in range(2, 1000):
+        cand = input_path.with_name(f"{input_path.stem} ({i})_out.txt")
+        if not cand.exists():
+            return cand
+    return base   # 极端情况（重名上千次）退回覆盖
+
+
 def _resolve_history_file(name: str) -> Path:
     if not name or not name.endswith("_out.txt"):
         raise HTTPException(400, "无效的文件名")
@@ -356,7 +386,8 @@ def info():
         "backend_ok": TV is not None,
         "backend_error": TV_ERROR,
         "cuda": bool(TV and __import__("torch").cuda.is_available()),
-        "model_loaded": _MODEL is not None,
+        "model_loaded": bool(_MODELS),
+        "model_devices": sorted(_MODELS),
         "model_dir_exists": TV is not None and Path(TV.MODEL_DIR).exists(),
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "yt_dlp": yt_dlp_ok,
@@ -456,12 +487,21 @@ def delete_job(job_id: str):
 
 
 @app.get("/api/history")
-def history():
+def history(q: str = ""):
+    """历史记录列表；带 q 时按文件名或正文内容过滤（服务端搜索）。"""
+    q = q.strip().lower()
     items = []
     exts = (TV.VIDEO_EXTENSIONS | TV.AUDIO_EXTENSIONS) if TV else set()
     for f in sorted(DOWNLOAD_DIR.glob("*_out.txt"),
                     key=lambda p: p.stat().st_mtime, reverse=True):
         title = f.name[:-len("_out.txt")]
+        if q:
+            try:
+                body = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                body = ""
+            if q not in title.lower() and q not in body.lower():
+                continue
         media_name, media_size = None, None
         for ext in exts:
             cand = DOWNLOAD_DIR / (title + ext)

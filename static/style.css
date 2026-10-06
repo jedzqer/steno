@@ -508,6 +508,8 @@ button { font-family: inherit; }
     to bottom, transparent 0, transparent 29px, rgba(49, 100, 142, 0.16) 29px, rgba(49, 100, 142, 0.16) 30px
   );
 }
+/* 展开全文：解除嵌套滚动，长文随主页面自然滚动 */
+.result-card.expanded .result-text { max-height: none; }
 
 /* ---------- 历史记录 ---------- */
 .hist-toolbar {
