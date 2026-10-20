@@ -1,15 +1,16 @@
-import sys
+import argparse
+import contextlib
 import os
+import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
-import argparse
 from pathlib import Path
 
 # SenseVoice 官方仓库的本地 checkout（项目根目录下），提供 model.py
 sys.path.insert(0, str(Path(__file__).resolve().parent / "SenseVoice-official"))
-import re
 
 # ---------------------------------------------------------------------------
 # 重型依赖一律惰性导入（import 放在真正使用它们的函数内）：
@@ -23,7 +24,6 @@ import re
 
 class TranscriptionCancelled(Exception):
     """转录被用户取消时抛出。"""
-    pass
 
 
 def extract_audio_from_video(video_path, output_audio_path, stop_event=None):
@@ -55,10 +55,8 @@ def extract_audio_from_video(video_path, output_audio_path, stop_event=None):
     stderr_chunks = []
 
     def _drain(stream):
-        try:
+        with contextlib.suppress(Exception):
             stderr_chunks.append(stream.read())
-        except Exception:
-            pass
 
     stderr_pipe = proc.stderr
     drain = None
@@ -85,10 +83,8 @@ def extract_audio_from_video(video_path, output_audio_path, stop_event=None):
     finally:
         if proc.poll() is None:      # 防御：任何异常路径都确保子进程被回收
             proc.kill()
-        try:
+        with contextlib.suppress(Exception):
             proc.wait(timeout=5)
-        except Exception:
-            pass
 
 
 SENSEVOICE_SR = 16000   # SenseVoiceSmall 模型要求的音频采样率
@@ -238,8 +234,39 @@ def is_url(text):
     return text.startswith(('http://', 'https://', 'www.'))
 
 
+def _existing_media_path(info, ydl, audio_only):
+    """在 output_dir 中查找该 URL 已经下载好的媒体文件。
+
+    yt-dlp 的 outtmpl 是 '%(title).150s [%(id)s].%(ext)s'，同一个 URL 每次
+    解析出的文件名是确定的，因此“已下载”可以靠文件名直接判定，从而跳过
+    重复下载（重新转录时尤其重要）。
+    返回 Path 或 None。
+    """
+    cands = []
+    try:
+        base = Path(ydl.prepare_filename(info))
+    except Exception:
+        base = None
+    if base is not None:
+        cands.append(base)
+        # 视频下载会合并为 mp4，prepare_filename 给出的可能是单个流的扩展名
+        if not audio_only:
+            cands.append(base.with_suffix('.mp4'))
+    for c in cands:
+        try:
+            if not c.exists() or c.stat().st_size == 0:
+                continue
+            # 存在未完成的 .part，说明上次下载中断，不能当作可用文件
+            if c.with_suffix(c.suffix + '.part').exists():
+                continue
+            return c
+        except OSError:
+            continue
+    return None
+
+
 def download_video(url, output_dir=DOWNLOAD_DIR, audio_only=False,
-                   cookies_from_browser=None, progress_cb=None):
+                   cookies_from_browser=None, progress_cb=None, skip_existing=True):
     """用 yt-dlp 从视频网站（YouTube、B站等数千个站点）下载视频/音频。
 
     返回下载后的文件路径（Path）。文件保存到 output_dir（默认项目 videos/ 目录），
@@ -251,6 +278,8 @@ def download_video(url, output_dir=DOWNLOAD_DIR, audio_only=False,
     progress_cb: 可选回调 progress_cb(status, downloaded, total, speed)，
         status 为 'downloading'/'finished'；供 WebUI 展示进度。回调内抛出的
         异常会原样传播（WebUI 借此用 DownloadCancelled 中断下载）。
+    skip_existing: 为 True 时，先解析元数据，若本地已有同名媒体文件则直接
+        返回该路径、跳过下载（重新转录不重复走网络）。
     """
     try:
         import yt_dlp
@@ -314,6 +343,17 @@ def download_video(url, output_dir=DOWNLOAD_DIR, audio_only=False,
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore  # 官方 README 即以普通 dict 传参；_Params 为私有 TypedDict，无法静态构造
+            if skip_existing:
+                try:
+                    meta = ydl.extract_info(url, download=False)
+                except Exception as e:
+                    meta = None
+                    print(f"（预检查失败，将直接下载: {e}）")
+                if meta:
+                    existing = _existing_media_path(meta, ydl, audio_only)
+                    if existing is not None:
+                        print(f"已存在，跳过下载: {existing}")
+                        return existing
             info = ydl.extract_info(url, download=True)
             # requested_downloads[0]['filepath'] 是合并/后处理后的最终文件路径
             filepath = info.get('requested_downloads', [{}])[0].get('filepath')

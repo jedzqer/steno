@@ -15,6 +15,7 @@ import argparse
 import importlib.util
 import os
 import queue
+import re
 import shutil
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import uuid
 import webbrowser
 from functools import lru_cache
 from pathlib import Path
+from typing import TypedDict
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -57,6 +59,16 @@ class _Cancelled(Exception):
     """任务被用户取消（内部控制流）。"""
 
 
+class _Attempt(TypedDict):
+    """一次转录尝试的参数（降级链的节点）。"""
+    device: str
+    use_itn: bool
+    chunk: int
+    overlap: int
+    why: str
+    retried: bool
+
+
 class Job:
     id: str
     kind: str
@@ -71,14 +83,15 @@ class Job:
     speed: float | None
     result_name: str | None
     error: str | None
+    media_path: str | None
     created: float
     started: float | None
     finished: float | None
 
     def __init__(self, kind: str, source: str, options: dict):
         self.id = uuid.uuid4().hex[:12]
-        self.kind = kind                  # 'upload' | 'url'
-        self.source = source              # 上传文件的绝对路径 / 视频 URL
+        self.kind = kind                  # 'upload' | 'url' | 'local'
+        self.source = source              # 上传/本地文件的绝对路径 / 视频 URL
         self.options = options
         self.status = "queued"            # queued/running/done/error/cancelled
         self.stage = ""                   # download/load/extract/transcribe
@@ -89,6 +102,9 @@ class Job:
         self.speed = None                 # B/s
         self.result_name = None           # 结果 txt 文件名（不含路径）
         self.error = None
+        # 媒体文件的落盘路径：下载或上传完成后写入。重试时据此跳过下载阶段，
+        # 直接复用已下载的媒体（重新转录不重新下载）。
+        self.media_path = None
         self.created = time.time()
         self.started = None
         self.finished = None
@@ -117,6 +133,8 @@ class Job:
             "speed": self.speed,
             "result": self.result_name,
             "error": self.error,
+            "has_media": bool(self.media_path) and Path(self.media_path).exists(),
+            "media": Path(self.media_path).name if self.media_path else None,
             "created": self.created,
             "started": self.started,
             "finished": self.finished,
@@ -189,6 +207,7 @@ def _cuda_state() -> bool | None:
 
 DOWNLOAD_ATTEMPTS = 3        # 下载总尝试次数（首次 + 2 次整体重试）
 DOWNLOAD_RETRY_DELAY = 4     # 重试前的等待秒数
+MAX_JOBS = 200               # 内存中保留的任务上限（超出后淘汰最旧的已结束任务）
 
 
 def _sleep_cancellable(seconds: float, stop_event: threading.Event) -> None:
@@ -217,33 +236,158 @@ def _download(job: Job) -> Path:
             job.downloaded, job.total, job.speed = downloaded, total, speed
             job.progress = (downloaded / total) if total else None
 
-    try:
-        for attempt in range(DOWNLOAD_ATTEMPTS):
-            try:
-                return TV.download_video(
-                    job.source,
-                    audio_only=o.get("audio_only", True),
-                    cookies_from_browser=o.get("cookies") or None,
-                    progress_cb=cb,
-                )
-            except Exception as e:
-                # 只对 yt-dlp 的下载失败（download_video 包装成 RuntimeError）做整体重试，
-                # 其余异常（含取消）原样抛出。每次重试都会重新请求 playurl，
-                # 常会分配到比上次更健康的 CDN 节点，对 mcdn/PCDN 抖动特别有效。
-                if attempt == DOWNLOAD_ATTEMPTS - 1 or not isinstance(e, RuntimeError):
-                    raise
-                if job.stop_event.is_set():
-                    raise
-                job.message = (f"下载出错，{DOWNLOAD_RETRY_DELAY} 秒后重试"
-                               f"（{attempt + 1}/{DOWNLOAD_ATTEMPTS - 1}）…")
-                print(f"[download] 第 {attempt + 1}/{DOWNLOAD_ATTEMPTS} 次下载失败，"
-                      f"{DOWNLOAD_RETRY_DELAY} 秒后重试: {e}")
-                _sleep_cancellable(DOWNLOAD_RETRY_DELAY, job.stop_event)
-                job.message = "下载中…"
-        raise RuntimeError("下载失败：重试次数已用完")   # 防御：理论上循环内必 return 或 raise
-    finally:
+    for attempt in range(DOWNLOAD_ATTEMPTS):
         if job.stop_event.is_set():
             raise _Cancelled()
+        try:
+            path = TV.download_video(
+                job.source,
+                audio_only=o.get("audio_only", True),
+                cookies_from_browser=o.get("cookies") or None,
+                progress_cb=cb,
+            )
+        except Exception as e:
+            # 只对 yt-dlp 的下载失败（download_video 包装成 RuntimeError）做整体重试，
+            # 其余异常（含取消）原样抛出。每次重试都会重新请求 playurl，
+            # 常会分配到比上次更健康的 CDN 节点，对 mcdn/PCDN 抖动特别有效。
+            if attempt == DOWNLOAD_ATTEMPTS - 1 or not isinstance(e, RuntimeError):
+                raise
+            if job.stop_event.is_set():
+                raise _Cancelled() from None
+            job.message = (f"下载出错，{DOWNLOAD_RETRY_DELAY} 秒后重试"
+                           f"（{attempt + 1}/{DOWNLOAD_ATTEMPTS - 1}）…")
+            print(f"[download] 第 {attempt + 1}/{DOWNLOAD_ATTEMPTS} 次下载失败，"
+                  f"{DOWNLOAD_RETRY_DELAY} 秒后重试: {e}")
+            _sleep_cancellable(DOWNLOAD_RETRY_DELAY, job.stop_event)
+            job.message = "下载中…"
+            continue
+        # 成功：先检查取消再返回（早前用 finally + raise 覆盖返回值的写法是隐雷）
+        if job.stop_event.is_set():
+            raise _Cancelled()
+        return path
+    raise RuntimeError("下载失败：重试次数已用完")   # 防御：循环内必 return 或 raise
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """判断异常是否为显存不足（CUDA OOM）——这类错误可以回落 CPU 重试。"""
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return ("out of memory" in msg or "cuda error" in msg or
+            "cuda oom" in msg or "cudnn_status_alloc_failed" in msg or
+            "cublas_status_alloc_failed" in msg)
+
+
+def _free_cuda_cache():
+    """OOM 后主动释放显存，避免重试时因碎片化再次失败。"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:       # 清理失败不应影响主流程
+        print(f"[cuda] 释放显存失败（已忽略）: {e}")
+
+
+def _next_attempt(prev: _Attempt, exc: BaseException | None, empty: bool) -> _Attempt | None:
+    """根据上一次失败的原因，给出下一次尝试的参数（降级链）。
+
+    降级顺序：OOM → 回落 CPU；其它异常 → 同参数重试一次；仍失败 → 关闭 ITN；
+    再失败 → 分块减半；再失败 → CPU + 小分块。空结果（无异常）时直接从
+    “关闭 ITN”开始（重试相同参数没意义）。
+    """
+    retried = prev.get("retried", False)
+    oom = exc is not None and _is_oom(exc)
+    if oom and prev["device"] != "cpu":
+        return _Attempt(device="cpu", use_itn=prev["use_itn"], chunk=prev["chunk"],
+                        overlap=prev["overlap"], retried=retried,
+                        why="显存不足，回落 CPU 重试")
+    if not empty and not retried:
+        return _Attempt(device=prev["device"], use_itn=prev["use_itn"], chunk=prev["chunk"],
+                        overlap=prev["overlap"], retried=True, why="同一参数重试一次")
+    if prev["use_itn"]:
+        return _Attempt(device=prev["device"], use_itn=False, chunk=prev["chunk"],
+                        overlap=prev["overlap"], retried=retried, why="关闭 ITN 后重试")
+    if prev["chunk"] > 30:
+        return _Attempt(device=prev["device"], use_itn=prev["use_itn"],
+                        chunk=max(30, prev["chunk"] // 2), overlap=prev["overlap"],
+                        retried=retried, why="分块减半后重试")
+    if prev["device"] != "cpu":
+        return _Attempt(device="cpu", use_itn=prev["use_itn"], chunk=prev["chunk"],
+                        overlap=prev["overlap"], retried=retried, why="回落 CPU 重试")
+    return None
+
+
+def _as_int(value, default: int) -> int:
+    """把选项里的数值安全地转成 int（选项可能来自表单/历史记录，类型不保证）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _transcribe_with_fallbacks(job: Job, audio_path: str) -> str:
+    """带降级链的转录：失败时自动换参数/换设备重试，而不是直接判任务失败。
+
+    每次尝试都更新 job.message，前端可见当前处于第几次尝试、为何降级。
+    """
+    tv = TV
+    if tv is None:
+        raise RuntimeError(f"后端依赖不可用，无法转录：{TV_ERROR}")
+    o = job.options
+    attempt: _Attempt | None = _Attempt(
+        device=str(o.get("device", "auto")),
+        use_itn=bool(o.get("use_itn", True)),
+        chunk=_as_int(o.get("chunk", 120), 120),
+        overlap=_as_int(o.get("overlap", 1), 1),
+        why="首次尝试",
+        retried=False,
+    )
+    last_err: BaseException | None = None
+    n = 0
+    while attempt is not None:
+        n += 1
+        if n > 1:
+            job.message = f"转录失败，{attempt['why']}（第 {n} 次尝试）…"
+        else:
+            job.message = "转录中…"
+        job.progress = 0.0
+        empty = False
+        try:
+            resolved = tv.resolve_device(attempt["device"])
+            model, kwargs = _ensure_model(resolved)
+            _check_cancel(job)
+
+            def on_progress(i, total, name, _job=job, _why=attempt["why"], _n=n):
+                _check_cancel(_job)
+                _job.progress = i / total if total else None
+                _job.message = (f"转录中 · 第 {i}/{total} 段"
+                                + (f"（{_why}）" if _n > 1 else ""))
+
+            text = tv.transcribe_audio(
+                audio_path, model, kwargs,
+                language=str(o.get("language", "zh")),
+                use_itn=attempt["use_itn"],
+                ban_emo_unk=False,
+                chunk_sec=attempt["chunk"],
+                overlap_sec=attempt["overlap"],
+                progress_cb=on_progress,
+                stop_event=job.stop_event,
+            )
+            if text and text.strip():
+                return text
+            # 空结果：当作一种可恢复失败，继续降级重试
+            last_err = RuntimeError("转录结果为空（音频可能没有可识别的语音）")
+            empty = True
+        except _Cancelled:
+            raise
+        except tv.TranscriptionCancelled:
+            raise _Cancelled() from None
+        except Exception as e:
+            last_err = e
+            empty = False
+            print(f"[transcribe] 第 {n} 次尝试失败: {type(e).__name__}: {e}")
+            if _is_oom(e):
+                _free_cuda_cache()
+        attempt = _next_attempt(attempt, last_err, empty)
+    raise RuntimeError(f"转录失败（已尝试 {n} 次）：{type(last_err).__name__}: {last_err}")
 
 
 def _run_job(job: Job):
@@ -259,9 +403,12 @@ def _run_job(job: Job):
         job.progress = None
         input_path = _download(job)
     else:
+        # 'upload'：上传后已落盘；'local'：复用既有媒体（重试/重新转录）
         input_path = Path(job.source)
         if not input_path.exists():
             raise RuntimeError(f"文件不存在: {input_path}")
+    # 记录媒体落盘路径：重试时据此跳过下载阶段（重新转录不重新下载）
+    job.media_path = str(input_path)
     _check_cancel(job)
 
     suffix = input_path.suffix.lower()
@@ -270,7 +417,7 @@ def _run_job(job: Job):
 
     _check_cancel(job)
     job.stage, job.message, job.progress = "load", "加载模型…", None
-    model, kwargs = _ensure_model(job.options.get("device", "auto"))
+    _ensure_model(job.options.get("device", "auto"))   # 预热：让“加载模型”阶段可见
     _check_cancel(job)
 
     temp_audio = None
@@ -302,28 +449,7 @@ def _run_job(job: Job):
     try:
         _check_cancel(job)
         job.stage, job.message, job.progress = "transcribe", "转录中…", 0.0
-
-        def on_progress(i, total, name):
-            _check_cancel(job)
-            job.progress = i / total if total else None
-            job.message = f"转录中 · 第 {i}/{total} 段"
-
-        try:
-            text = TV.transcribe_audio(
-                audio_path, model, kwargs,
-                language=job.options.get("language", "zh"),
-                use_itn=job.options.get("use_itn", True),
-                ban_emo_unk=False,
-                chunk_sec=int(job.options.get("chunk", 120)),
-                overlap_sec=int(job.options.get("overlap", 1)),
-                progress_cb=on_progress,
-                stop_event=job.stop_event,
-            )
-        except TV.TranscriptionCancelled:
-            raise _Cancelled() from None
-
-        if not text.strip():
-            raise RuntimeError("转录结果为空（音频可能没有可识别的语音）")
+        text = _transcribe_with_fallbacks(job, audio_path)
 
         out_path = _unique_out_path(input_path)   # 重名不静默覆盖，追加 (2)/(3)…
         out_path.write_text(text, encoding="utf-8")
@@ -440,6 +566,37 @@ def info():
     }
 
 
+DEFAULT_OPTIONS = {
+    "audio_only": True,
+    "cookies": "",
+    "language": "zh",
+    "device": "auto",
+    "use_itn": True,
+    "chunk": 120,
+    "overlap": 1,
+}
+
+
+def _enqueue_job(kind: str, source: str, options: dict) -> Job:
+    """登记并排队一个任务；同时清理超出上限的旧任务（内存不无限增长）。"""
+    job = Job(kind, source, options)
+    JOBS[job.id] = job
+    JOB_QUEUE.put(job.id)
+    _prune_jobs()
+    return job
+
+
+def _prune_jobs():
+    """JOBS 是纯内存字典：长时间运行会无限增长，淘汰最旧的已结束任务。"""
+    if len(JOBS) <= MAX_JOBS:
+        return
+    finished = [j for j in JOBS.values()
+                if j.status in ("done", "error", "cancelled")]
+    finished.sort(key=lambda j: j.created)
+    for j in finished[:max(0, len(JOBS) - MAX_JOBS)]:
+        JOBS.pop(j.id, None)
+
+
 @app.post("/api/jobs")
 async def create_job(
     mode: str = Form(...),                      # 'file' | 'url'
@@ -477,7 +634,7 @@ async def create_job(
             raise HTTPException(500, f"保存上传文件失败: {e}") from e
         source = str(dest)
 
-    job = Job(mode, source, {
+    job = _enqueue_job(mode, source, {
         "audio_only": audio_only,
         "cookies": cookies,
         "language": language,
@@ -486,9 +643,57 @@ async def create_job(
         "chunk": chunk,
         "overlap": overlap,
     })
-    JOBS[job.id] = job
-    JOB_QUEUE.put(job.id)
     return {"id": job.id}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id: str):
+    """重试一个已结束的任务：复用已下载/已上传的媒体文件，跳过下载阶段。
+
+    失败的任务（如显存不足、被取消）可以一键重来，不必重新下载视频。
+    """
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "任务不存在")
+    if job.status in ("queued", "running"):
+        raise HTTPException(409, "任务进行中，请先取消")
+    media = job.media_path
+    options = dict(job.options)
+    if media and Path(media).exists():
+        # 已有本地媒体：直接复用，跳过下载阶段（重新转录不重新下载）
+        new_job = _enqueue_job("local", media, options)
+        return {"id": new_job.id, "reused_media": Path(media).name}
+    if job.kind == "url":
+        # 下载阶段就失败了：没有本地媒体，只能重新下载一次
+        new_job = _enqueue_job("url", job.source, options)
+        return {"id": new_job.id, "reused_media": None}
+    raise HTTPException(400, "源媒体文件已不存在，无法直接重试（请重新提交链接或文件）")
+
+
+@app.post("/api/history/retry")
+def history_retry(name: str):
+    """对历史记录重新转录：直接用 videos/ 里的源媒体文件，不重新下载。"""
+    target = _resolve_history_file(name)
+    stem = target.name[:-len("_out.txt")]
+    exts = (TV.VIDEO_EXTENSIONS | TV.AUDIO_EXTENSIONS) if TV else set()
+    media = None
+    # 正常情况 stem 就是媒体文件名；重名结果（如 “xxx (2)_out.txt”）则去掉序号再找
+    stems = [stem]
+    m = re.match(r"^(.*) \(\d+\)$", stem)
+    if m:
+        stems.append(m.group(1))
+    for s in stems:
+        for ext in exts:
+            cand = DOWNLOAD_DIR / (s + ext)
+            if cand.exists() and cand.stat().st_size > 0:
+                media = cand
+                break
+        if media is not None:
+            break
+    if media is None:
+        raise HTTPException(400, "找不到对应的源媒体文件，无法重新转录")
+    new_job = _enqueue_job("local", str(media), dict(DEFAULT_OPTIONS))
+    return {"id": new_job.id, "reused_media": media.name}
 
 
 @app.get("/api/jobs")

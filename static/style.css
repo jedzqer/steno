@@ -513,6 +513,12 @@ button { font-family: inherit; }
 }
 .job-row b { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
 .job-row .mini-btn { padding: 4px 11px; font-size: 12px; }
+/* 失败原因：单行截断，完整内容在 title 里 */
+.job-err-inline {
+  flex: 0 1 auto; max-width: 34%; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--seal-deep); font-size: 12px;
+}
 
 /* ---------- 结果：横格信纸 ---------- */
 #resultWrap { animation: rise 0.35s ease; }
@@ -570,6 +576,8 @@ button { font-family: inherit; }
 .hc-body span { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .hc-arrow { color: var(--faint); font-size: 15px; transition: transform 0.18s, color 0.18s; }
 .hist-card:hover .hc-arrow { transform: translateX(3px); color: var(--seal-deep); }
+/* 历史卡片上的“重新转录”：复用已下载的媒体，不重新下载 */
+.hist-card .mini-btn { padding: 4px 10px; font-size: 12px; flex: none; }
 
 .empty {
   grid-column: 1 / -1; text-align: center; padding: 60px 0; color: var(--faint); font-size: 14px;

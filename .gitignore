@@ -9,6 +9,9 @@ __pycache__/
 # 工具缓存 / 本地配置
 .pi/
 
+# Windows 重定向误建的空文件
+nul
+
 # 媒体文件（体积大，不入库）
 videos/
 *.mp4

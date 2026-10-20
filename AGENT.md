@@ -22,6 +22,7 @@ steno/
 │   ├── index.html
 │   ├── style.css
 │   └── app.js
+├── smoke_test.py            # 冒烟测试：降级链 / 重试接口 / 媒体复用 / 任务上限（python smoke_test.py）
 ├── README.md                # 面向使用者的说明
 ├── AGENT.md                 # 本文件
 ├── .gitignore
@@ -71,6 +72,36 @@ main()
 - **WebUI 架构**：`webui.py` 完全复用 `transcribe_video.py`（导入为模块），不重复实现业务逻辑。单 worker 线程串行消费任务队列（GPU 推理串行化）；模型进程内缓存只加载一次；取消通过 `stop_event`（转录阶段核心脚本原生支持；下载阶段 WebUI 在 progress_cb 里抛 `yt_dlp.utils.DownloadCancelled` 沿 hook 传播中断）；前端为 static/ 下原生三件套，无构建步骤，轮询 `/api/jobs` 展示进度
 - **emoji 过滤**：funasr 会把 SenseVoice 的情绪/事件标记（`<|ANGRY|>`、`<|BGM|>`）转成 emoji（😡🎼等），按 Unicode 区段 `U+1F000–U+1FFFF` 整体过滤，勿改回单字符枚举
 - **stdout 编码兜底**：main() 入口对 stdout/stderr 做 `reconfigure(errors='replace')`，避免重定向/管道输出时 GBK 无法编码 emoji 而崩溃
+
+## 转录降级链（WebUI）
+
+转录阶段失败不会直接放弃，而是按固定阶梯逐级降级重试，由 `webui.py` 的 `_next_attempt()` 计算下一次尝试的参数：
+
+```text
+OOM / 显存不足          → 立刻回落 CPU（其余参数不变）
+其他异常（首次）        → 同参数重试一次
+仍然异常                → 关闭 ITN（use_itn=False）后重试
+仍然异常                → 分块减半（120 → 60 → 30，下限 30s）后重试
+仍然异常                → 回落 CPU 重试
+```
+
+- 每次降级都会更新 `job.message`（前端可见），并调用 `torch.cuda.empty_cache()` 释放显存
+- 空结果（无异常但转出空文本）不浪费一次同参数重试，直接走“关闭 ITN”
+- 阶梯耗尽后抛 `RuntimeError(f"转录失败（已尝试 {n} 次）：...")`，任务标记为 error，前端显示错误摘要 + “重试”按钮
+
+## 重试 / 复用媒体
+
+- `Job.media_path` 记录实际使用的本地媒体路径（上传或下载所得），`to_dict()` 额外返回 `has_media` / `media`
+- `POST /api/jobs/{id}/retry`：媒体文件仍在 → 以 `kind="local"` 新建任务，**跳过下载阶段**（重新转录不重新下载）；媒体已丢失且原任务是 URL → 重新下载（`kind="url"`）；其它情况 → HTTP 400
+- `POST /api/history/retry?name=<xxx_out.txt>`：从 `videos/` 里按文件名主干找源媒体（兼容 `xxx (2)_out.txt` 这种重名后缀），复用它重新转录
+- 前端：任务列表错误行显示错误摘要 + “重试”，已完成且有媒体的任务显示“重新转录”，历史卡片显示“重新转录”
+- `download_video(..., skip_existing=True)`：先 `extract_info(download=False)` 取文件名，若文件已存在且非空且没有残留 `.part`，直接复用而不下载
+
+## 稳定性细节
+
+- `JOBS` 为内存字典，上限 `MAX_JOBS = 200`，`_prune_jobs()` 在入队时淘汰最旧的已结束任务，避免长期运行内存无限增长
+- 下载失败已有重试（`DOWNLOAD_ATTEMPTS = 3`、`DOWNLOAD_RETRY_DELAY = 4`，yt-dlp 自身还有 `retries=10` 等）
+- 下载阶段的取消检查放在成功返回之前，**不放在 finally 里**（finally 抛异常会覆盖成功结果）
 
 ## 注意事项 / 已知坑
 

@@ -278,6 +278,18 @@ function afterSubmit() {
   pollNow();                    // 立即轮询：模型已缓存时任务可能几秒内完成
 }
 
+// 重试任务：复用已下载/已上传的媒体（后端跳过下载阶段）
+async function retryJob(id) {
+  try {
+    const res = await api(`/api/jobs/${id}/retry`, { method: 'POST' });
+    watchJob(res.id);
+    toast(res.reused_media ? `已重新排队（复用 ${res.reused_media}）` : '已重新排队');
+    pollNow();
+  } catch (e) {
+    toast('重试失败：' + e.message, 'err');
+  }
+}
+
 // ============================ 任务渲染 ============================
 const stagesFor = job => {
   const audio = AUDIO_EXT.includes(extOf(job.display));
@@ -341,9 +353,20 @@ function jobCardEl(job) {
   return card;
 }
 function jobRowEl(job) {
+  // 失败/取消：总是可以重试（URL 任务会重新下载）；已完成：仅当本地媒体还在才能“重新转录”
+  const canRetry = job.status === 'error' || job.status === 'cancelled' ||
+                   (job.status === 'done' && job.has_media);
+  const retryBtn = canRetry
+    ? h('button', { class: 'ghost-btn mini-btn', 'data-retry-job': job.id },
+        h('span', { class: 'btn-label', text: job.status === 'done' ? '重新转录' : '重试' }))
+    : null;
+  const err = job.status === 'error' && job.error
+    ? h('span', { class: 'job-err-inline', title: job.error, text: job.error })
+    : null;
   return h('div', { class: 'job-row' },
     h('b', { text: job.display, title: job.display }),
     pillEl(job.status),
+    err,
     (job.status === 'done' && job.result)
       ? h('button', { class: 'ghost-btn mini-btn', text: '查看', 'data-view-result': job.id })
       : null,
@@ -351,6 +374,7 @@ function jobRowEl(job) {
       ? h('button', { class: 'ghost-btn mini-btn', 'data-copy-job': job.id },
           h('span', { class: 'btn-label', text: '复制' }))
       : null,
+    retryBtn,
     h('button', { class: 'icon-btn', title: '从列表移除', 'data-del-job': job.id }, ICON.close()));
 }
 function uploadCardEl(u) {
@@ -475,6 +499,10 @@ function histCardEl(item) {
       h('b', { text: item.title, title: item.title }),
       h('span', { text: `${fmtTime(item.mtime)} · 文本 ${fmtBytes(item.size)}` +
         (item.media ? ` · 源文件 ${fmtBytes(item.media_size)}` : '') })),
+    item.media
+      ? h('button', { class: 'ghost-btn mini-btn', 'data-hist-retry': item.name },
+          h('span', { class: 'btn-label', text: '重新转录' }))
+      : null,
     h('span', { class: 'hc-arrow', text: '→' }));
 }
 let histSearchTimer = null;
@@ -669,6 +697,12 @@ function bind() {
           pollOnce();
         })
         .catch(err => toast(err.message, 'err'));
+      return;
+    }
+    const retryId = e.target.closest('[data-retry-job]')?.dataset.retryJob;
+    if (retryId) {
+      retryJob(retryId);
+      return;
     }
   });
 
@@ -685,6 +719,19 @@ function bind() {
     histSearchTimer = setTimeout(renderHistory, 250);   // 正文搜索在服务端做，去抖后再请求
   });
   $('#histGrid').addEventListener('click', e => {
+    // “重新转录”按钮优先处理（否则会误触发打开弹窗）
+    const retryName = e.target.closest('[data-hist-retry]')?.dataset.histRetry;
+    if (retryName) {
+      e.stopPropagation();
+      api('/api/history/retry?name=' + encodeURIComponent(retryName), { method: 'POST' })
+        .then(res => {
+          watchJob(res.id);
+          toast('已加入队列（复用已下载的媒体）');
+          pollNow();
+        })
+        .catch(err => toast(err.message, 'err'));
+      return;
+    }
     const card = e.target.closest('[data-hist]');
     if (card) openModal(card.dataset.hist);
   });
