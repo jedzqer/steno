@@ -120,7 +120,7 @@ function chipEl(label, type) {
 }
 function startHintText(i) {
   if (!i.backend_ok) return '后端依赖缺失，请先安装 torch / funasr';
-  if (!i.model_loaded && i.model_dir_exists) return '首次转录需先加载模型，约需十几秒';
+  if (!i.model_loaded && i.model_dir_exists) return i.model_loading ? '正在后台加载模型，稍等片刻即可提交任务' : '首次转录需先加载模型，约需十几秒';
   if (!i.ffmpeg) return '未检测到 FFmpeg，视频文件将无法提取音频';
   return '';
 }
@@ -128,11 +128,19 @@ function renderInfo() {
   const i = state.info;
   if (!i) return;
   const chips = [];
-  chips.push(chipEl(i.cuda ? 'GPU · CUDA 就绪' : 'CPU 模式', i.cuda ? 'ok' : 'warn'));
+  if (i.cuda === true) {
+    chips.push(chipEl('GPU · CUDA 就绪', 'ok'));
+  } else if (i.cuda === false) {
+    chips.push(chipEl('CPU 模式', 'warn'));
+  } else {
+    chips.push(chipEl('GPU 探测中…', 'warn'));
+  }
   if (!i.backend_ok) {
     chips.push(chipEl('后端依赖缺失', 'err'));
   } else if (i.model_loaded) {
     chips.push(chipEl('模型已加载', 'ok'));
+  } else if (i.model_loading) {
+    chips.push(chipEl('模型加载中…', 'warn'));
   } else {
     chips.push(chipEl(i.model_dir_exists ? '模型未加载' : '模型权重缺失', i.model_dir_exists ? 'warn' : 'err'));
   }

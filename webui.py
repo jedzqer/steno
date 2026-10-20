@@ -23,6 +23,7 @@ import time
 import traceback
 import uuid
 import webbrowser
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -142,6 +143,48 @@ def _ensure_model(device: str):
         if resolved not in _MODELS:
             _MODELS[resolved] = TV.load_model(device=resolved)
         return _MODELS[resolved]
+
+
+_MODEL_LOADING = False      # 后台预加载进行中（供 /api/info 展示）
+
+
+def _preload_model_async(device: str = "auto"):
+    """后台线程预加载模型：把 torch 导入 + SenseVoice 权重加载的一次性成本
+    挪到启动之后的后台，不阻塞 WebUI 打开；第一个任务进来时通常已就绪。"""
+    global _MODEL_LOADING
+    if TV is None:
+        return
+    _MODEL_LOADING = True
+    try:
+        print("[preload] 正在后台加载模型（torch 导入 + SenseVoice 权重）...")
+        _ensure_model(device)
+        print("[preload] 模型预加载完成")
+    except Exception as e:
+        print(f"[preload] 模型预加载失败（不影响使用，转录时会重试）: {e}")
+    finally:
+        _MODEL_LOADING = False
+
+
+@lru_cache(maxsize=1)
+def _cuda_available() -> bool:
+    """CUDA 是否可用（结果缓存，torch 的 import 约 10s，不该每次 /api/info 都付这个代价）。"""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+_CUDA_RESULT: list[bool | None] = [None]     # None = 尚未探测完成
+
+
+def _warm_cuda_async():
+    """后台探测 CUDA 可用性：import torch 较慢，不能在 HTTP 请求里同步等。"""
+    _CUDA_RESULT[0] = _cuda_available()
+
+
+def _cuda_state() -> bool | None:
+    return _CUDA_RESULT[0]
 
 
 DOWNLOAD_ATTEMPTS = 3        # 下载总尝试次数（首次 + 2 次整体重试）
@@ -345,8 +388,8 @@ def _unique_dest(directory: Path, filename: str) -> Path:
 def _cleanup_temp(path) -> None:
     try:
         os.unlink(path)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"[cleanup] 临时文件删除失败（已忽略）: {e}")
 
 
 def _unique_out_path(input_path: Path) -> Path:
@@ -385,8 +428,10 @@ def info():
     return {
         "backend_ok": TV is not None,
         "backend_error": TV_ERROR,
-        "cuda": bool(TV and __import__("torch").cuda.is_available()),
+        "cuda": _cuda_state(),
+        "cuda_checked": _cuda_state() is not None,
         "model_loaded": bool(_MODELS),
+        "model_loading": _MODEL_LOADING,
         "model_devices": sorted(_MODELS),
         "model_dir_exists": TV is not None and Path(TV.MODEL_DIR).exists(),
         "ffmpeg": shutil.which("ffmpeg") is not None,
@@ -537,8 +582,8 @@ def history_delete(name: str):
         if cand.exists():
             try:
                 cand.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                print(f"[cleanup] 历史文件删除失败（已忽略）: {e}")
             break
     return {"ok": True}
 
@@ -576,12 +621,20 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8321)
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    parser.add_argument("--no-preload", action="store_true",
+                        help="启动后不在后台预加载模型（默认后台预加载，让第一个任务更快）")
     args = parser.parse_args()
 
     url = f"http://{args.host}:{args.port}/"
     print(f"steno WebUI 启动中: {url}")
     if not args.no_browser:
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+
+    # 后台预加载模型：不阻塞界面启动（torch 导入 ~10s + 权重加载）
+    if not args.no_preload:
+        threading.Thread(target=_preload_model_async, daemon=True).start()
+    # CUDA 探测同样放后台（需要 import torch）
+    threading.Thread(target=_warm_cuda_async, daemon=True).start()
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

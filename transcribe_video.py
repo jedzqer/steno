@@ -10,11 +10,15 @@ from pathlib import Path
 # SenseVoice 官方仓库的本地 checkout（项目根目录下），提供 model.py
 sys.path.insert(0, str(Path(__file__).resolve().parent / "SenseVoice-official"))
 import re
-import numpy as np
-import torch
-import soundfile as sf
-from model import SenseVoiceSmall  # type: ignore  # 运行时经上方 sys.path 注入解析（外部 SenseVoice 目录），静态分析无法解析
-from funasr.utils.postprocess_utils import rich_transcription_postprocess
+
+# ---------------------------------------------------------------------------
+# 重型依赖一律惰性导入（import 放在真正使用它们的函数内）：
+#   - torch：单独 import 约 10s（Windows + CUDA 运行时）
+#   - funasr / SenseVoice-official/model.py：更慢
+#   - soundfile / numpy：轻一些，但仍非零
+# 这样 CLI 的 --help、参数校验、以及 WebUI 的启动都不再被这些 import 拖慢；
+# 真正开始转录时才会付出一次性的加载成本（此时本来就要加载模型权重）。
+# ---------------------------------------------------------------------------
 
 
 class TranscriptionCancelled(Exception):
@@ -97,6 +101,8 @@ def decode_audio_with_ffmpeg(audio_path, sr=SENSEVOICE_SR):
     （sf.read 会报 Format not recognised），此类文件必须经 ffmpeg 解码；
     同时统一重采样到模型要求的 16kHz。返回 (numpy.float32 波形, 采样率)。
     """
+    import numpy as np
+
     cmd = [
         'ffmpeg', '-nostdin', '-v', 'error',
         '-i', str(audio_path),
@@ -167,6 +173,10 @@ def transcribe_audio(audio_path, model, kwargs, language="zh", use_itn=True,
     progress_cb(index, total, name): 每完成一段回调一次。
     stop_event(threading.Event): 置位时取消转录。
     """
+    import soundfile as sf
+    import torch
+    from funasr.utils.postprocess_utils import rich_transcription_postprocess
+
     # libsndfile 不支持 m4a/aac 等格式（报 Format not recognised），且模型要求 16kHz：
     # soundfile 读不出、或采样率非 16kHz 的音频统一回落到 ffmpeg 解码 + 重采样
     data = sr = None
@@ -318,11 +328,15 @@ def download_video(url, output_dir=DOWNLOAD_DIR, audio_only=False,
 
 def resolve_device(device="auto"):
     if device == "auto":
+        import torch
         return "cuda:0" if torch.cuda.is_available() else "cpu"
     return device
 
 
 def load_model(model_dir=MODEL_DIR, device="auto"):
+    # 惰性导入 SenseVoice 模型定义（会连带 import torch/funasr）
+    from model import SenseVoiceSmall  # type: ignore
+
     device = resolve_device(device)
     m, kwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device=device)
     m.eval()
@@ -350,7 +364,7 @@ def main():
     parser.add_argument('--ban-emo-unk', action='store_true', help='过滤 emo_unk 标记')
     parser.add_argument('--chunk', type=int, default=120, help='分块时长（秒）')
     parser.add_argument('--overlap', type=int, default=1, help='分块重叠（秒）')
-    
+
     args = parser.parse_args()
 
     if is_url(args.input):
@@ -368,36 +382,37 @@ def main():
         if not input_path.exists():
             print(f"错误: 文件 '{input_path}' 不存在")
             sys.exit(1)
-    
+
     is_video = input_path.suffix.lower() in VIDEO_EXTENSIONS
     is_audio = input_path.suffix.lower() in AUDIO_EXTENSIONS
-    
+
     if not is_video and not is_audio:
         print(f"错误: 不支持的文件格式 '{input_path.suffix}'")
         print(f"支持的视频格式: {', '.join(VIDEO_EXTENSIONS)}")
         print(f"支持的音频格式: {', '.join(AUDIO_EXTENSIONS)}")
         sys.exit(1)
-    
-    device = resolve_device(args.device)
-    print(f"正在加载模型（{device}）...")
-    m, kwargs = load_model(device=device)
-    
+
+    # 注意：resolve_device 会触发 torch 的 import（约 10s），所以先给出提示再调用
+    print("正在加载模型（首次需要导入 torch 并读取权重，请稍候）...")
+    m, kwargs = load_model(device=args.device)
+    print(f"模型已就绪（{resolve_device(args.device)}）")
+
     temp_audio_path = None
     cleanup_temp = False
     if is_video:
         print(f"正在从视频中提取音频: {input_path}")
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
             temp_audio_path = temp_audio.name
-        
+
         if not extract_audio_from_video(str(input_path), temp_audio_path):
             sys.exit(1)
-        
+
         audio_path = temp_audio_path
         cleanup_temp = True
     else:
         audio_path = str(input_path)
         cleanup_temp = False
-    
+
     try:
         print(f"正在转录音频: {audio_path}")
         text = transcribe_audio(
@@ -408,16 +423,16 @@ def main():
             chunk_sec=args.chunk,
             overlap_sec=args.overlap,
         )
-        
+
         if args.output:
             output_path = Path(args.output)
         else:
             output_path = input_path.with_name(f"{input_path.stem}_out.txt")
-        
+
         output_path.write_text(text, encoding="utf-8")
         print(f"\n转录完成！结果已保存到: {output_path}")
         print(f"\n转录内容:\n{text}")
-        
+
     finally:
         if cleanup_temp and temp_audio_path and os.path.exists(temp_audio_path):
             os.unlink(temp_audio_path)

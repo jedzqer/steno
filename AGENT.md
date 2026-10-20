@@ -64,6 +64,8 @@ main()
 ## 关键设计决策（勿随意更改）
 
 - **120 秒分块 + 1 秒重叠**：SenseVoiceSmall 的 CTC decoder 在约 120s 内表现最佳；更短会切断语句，更长对齐质量下降。`--chunk`/`--overlap` 可调
+- **重型依赖惰性导入**：`torch`（单独 import 约 10s）、`funasr`、`SenseVoice-official/model.py`、`soundfile`、`numpy` 一律在用到的函数内部 import。模块顶层只保留轻量 import，因此 `python transcribe_video.py --help` 与 `import transcribe_video` 均为 0.1s 级，而 WebUI 启动不再被模型依赖拖到 50s+
+- **模型后台预加载**：WebUI 启动后用后台线程加载模型（`--no-preload` 可关闭），`/api/info` 里的 `model_loading` / `cuda_checked` 反映探测进度；`_MODELS` 仍按设备缓存，同一设备只加载一次
 - **sys.path 注入**：`from model import SenseVoiceSmall` 依赖脚本把项目内 `SenseVoice-official/` 插入 sys.path；该目录是独立 git 仓库
 - **yt-dlp 用 Python API 而非子进程**：`YoutubeDL(opts)` + `extract_info(url, download=True)`，最终路径取 `info['requested_downloads'][0]['filepath']`（含合并/后处理）。`noplaylist=True` 防止播放列表整包下载。`download_video()` 另有可选 `progress_cb(status, downloaded, total, speed)` 供 WebUI 展示进度（默认 None，不影响 CLI）
 - **WebUI 架构**：`webui.py` 完全复用 `transcribe_video.py`（导入为模块），不重复实现业务逻辑。单 worker 线程串行消费任务队列（GPU 推理串行化）；模型进程内缓存只加载一次；取消通过 `stop_event`（转录阶段核心脚本原生支持；下载阶段 WebUI 在 progress_cb 里抛 `yt_dlp.utils.DownloadCancelled` 沿 hook 传播中断）；前端为 static/ 下原生三件套，无构建步骤，轮询 `/api/jobs` 展示进度

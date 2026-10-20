@@ -24,6 +24,7 @@ pip install torch soundfile yt-dlp
 ```bash
 python webui.py            # 启动后自动打开浏览器，默认 http://127.0.0.1:8321
 python webui.py --port 9000 --no-browser
+python webui.py --no-preload   # 不在后台预加载模型（默认后台预加载）
 ```
 
 - 拖放 / 选择本地媒体文件，或粘贴视频链接（YouTube、B站等，支持仅下载音轨与浏览器 cookies）
@@ -72,6 +73,7 @@ python transcribe_video.py "audio.wav" -o "result.txt"
 
 ## 技术说明
 
+- **启动速度：** torch / funasr / soundfile 等重型依赖均为惰性导入（用到的函数内部再 import），`python transcribe_video.py --help` 与 WebUI 启动均在 1 秒内完成；模型与 torch 的加载放到后台线程，不阻塞界面
 - **URL 下载：** 基于 [yt-dlp](https://github.com/yt-dlp/yt-dlp) 的 Python API，默认选最优画质并与音轨合并为 mp4；`--audio-only` 仅拉取音轨
 - **分块策略：** 120 秒/块，1 秒重叠。SenseVoiceSmall 的 CTC decoder 在约 120 秒内表现最佳——更短会产生切块边界噪音（语句断裂、重复），更长则对齐质量下降
 - **显存占用：** 模型 234M 参数（FP32 ~934MB），120s 分块推理约占用 1.5GB，4GB 显存可正常运行
