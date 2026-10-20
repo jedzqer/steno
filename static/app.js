@@ -149,8 +149,21 @@ function renderInfo() {
   $('#sysChips').replaceChildren(...chips);
   $('#startHint').replaceChildren(startHintText(i));
 }
+// 状态芯片的签名：只有相关字段变化时才重绘，避免无意义的界面抖动
+function infoSignature(i) {
+  return [i.backend_ok, i.cuda, i.model_loaded, i.model_loading, i.ffmpeg, i.yt_dlp].join('|');
+}
+let infoSig = '';
 async function loadInfo() {
-  try { state.info = await api('/api/info'); renderInfo(); } catch { /* 忽略 */ }
+  try {
+    const i = await api('/api/info');
+    state.info = i;
+    const sig = infoSignature(i);
+    if (sig !== infoSig) {
+      infoSig = sig;
+      renderInfo();
+    }
+  } catch { /* 忽略 */ }
 }
 
 // ============================ 视图与 Tab ============================
@@ -569,6 +582,10 @@ function pollOnce() {
     for (const id of [...state.watching]) if (!seen.has(id)) state.watching.delete(id);
     state.jobs = jobs;
     renderJobs();
+    // 顺带刷新系统状态：模型在后台加载完（或 CUDA 探测完成）后，芯片要能自动转态。
+    // loadInfo 内部按签名比对，只在状态真的变了才重绘那几枚芯片，
+    // 不会动表单/列表，不影响用户正在做的操作。
+    loadInfo();
     schedulePoll(hadWork || jobs.some(j => j.status === 'queued' || j.status === 'running'));
   }).catch(() => {
     // 服务退出（用户点了"退出服务"）后静默停止轮询
